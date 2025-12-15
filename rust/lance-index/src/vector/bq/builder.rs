@@ -260,6 +260,7 @@ impl Quantization for RabitQuantizer {
         let mut metadata = self.metadata.clone();
         if let Some(args) = args {
             metadata.pack = args.transposed;
+            metadata.packed = args.transposed;
         }
         metadata
     }
