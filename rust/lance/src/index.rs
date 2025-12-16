@@ -1518,6 +1518,19 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
+                    "IVF_HNSW_RQ" => {
+                        let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
+                            self.object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
                     _ => Err(Error::Index {
                         message: format!("Unsupported index type: {}", index_metadata.index_type),
                         location: location!(),
