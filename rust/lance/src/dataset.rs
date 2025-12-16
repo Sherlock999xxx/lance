@@ -876,6 +876,7 @@ impl Dataset {
                 let request = DescribeTableRequest {
                     id: Some(table_id.clone()),
                     version: None,
+                    with_table_uri: None,
                 };
                 let response =
                     namespace
@@ -1483,7 +1484,7 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
-    /// Take [BlobFile] by row ids (row address).
+    /// Take [BlobFile] by row IDs.
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],

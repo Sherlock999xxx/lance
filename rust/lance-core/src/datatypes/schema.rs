@@ -513,7 +513,7 @@ impl Schema {
     // TODO: pub(crate)
     /// Get the maximum field id in the schema.
     ///
-    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
+    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id()`
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
@@ -928,7 +928,9 @@ pub enum BlobHandling {
 
 impl BlobHandling {
     fn should_unload(&self, field: &Field) -> bool {
-        if !field.data_type().is_binary_like() {
+        // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
+        // even if the physical data type is not binary-like.
+        if !(field.data_type().is_binary_like() || field.is_blob()) {
             return false;
         }
         match self {

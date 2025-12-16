@@ -11,9 +11,11 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
+use lance_core::datatypes::Field;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tracing::{
@@ -194,6 +196,45 @@ fn auto_migrate_corruption() -> bool {
             .map(|s| str_is_truthy(&s))
             .unwrap_or(true)
     })
+}
+
+/// Derive a friendly (but not necessarily unique) type name from a type URL.
+/// Extract a human-friendly type name from a type URL.
+///
+/// Strips prefixes like `type.googleapis.com/` and package names, then removes
+/// trailing `IndexDetails` / `Index` so callers get a concise display name.
+fn type_name_from_uri(index_uri: &str) -> String {
+    let type_name = index_uri.rsplit('/').next().unwrap_or(index_uri);
+    let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
+    type_name.trim_end_matches("IndexDetails").to_string()
+}
+
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+/// Legacy mapping from type URL to the old IndexType string for backwards compatibility.
+///
+/// If `index_type_hint` is provided (e.g. parsed from the index statistics of a concrete
+/// index instance), it takes precedence so callers can surface the exact index type even
+/// when the type URL alone is too generic (such as VectorIndexDetails).
+fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
+    if let Some(hint) = index_type_hint {
+        return hint.to_string();
+    }
+
+    let base = type_name_from_uri(index_uri);
+
+    match base.as_str() {
+        "BTree" => IndexType::BTree.to_string(),
+        "Bitmap" => IndexType::Bitmap.to_string(),
+        "LabelList" => IndexType::LabelList.to_string(),
+        "NGram" => IndexType::NGram.to_string(),
+        "ZoneMap" => IndexType::ZoneMap.to_string(),
+        "BloomFilter" => IndexType::BloomFilter.to_string(),
+        "Inverted" => IndexType::Inverted.to_string(),
+        "Json" => IndexType::Scalar.to_string(),
+        "Flat" | "Vector" => IndexType::Vector.to_string(),
+        other if other.contains("Vector") => IndexType::Vector.to_string(),
+        _ => "N/A".to_string(),
+    }
 }
 
 /// Builds index.
@@ -904,25 +945,53 @@ impl DatasetIndexExt for Dataset {
         let field_id = metadatas[0].fields[0];
         let field_path = self.schema().field_path(field_id)?;
 
-        // Open all delta indices
-        let indices = stream::iter(metadatas.iter())
-            .then(|m| {
-                let field_path = field_path.clone();
-                async move {
-                    self.open_generic_index(&field_path, &m.uuid.to_string(), &NoOpMetricsCollector)
-                        .await
+        let mut indices_stats = Vec::with_capacity(metadatas.len());
+        let mut index_uri: Option<String> = None;
+        let mut index_typename: Option<String> = None;
+
+        for meta in metadatas.iter() {
+            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
+            let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
+            if index_uri.is_none() {
+                index_uri = Some(index_details.type_url.clone());
+            }
+            let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+
+            if let Ok(plugin) = index_details_wrapper.get_plugin() {
+                if index_typename.is_none() {
+                    index_typename = Some(plugin.name().to_string());
                 }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
 
-        // Stastistics for each delta index.
-        let indices_stats = indices
-            .iter()
-            .map(|idx| idx.statistics())
-            .collect::<Result<Vec<_>>>()?;
+                if let Some(stats) = plugin
+                    .load_statistics(index_store.clone(), index_details.as_ref())
+                    .await?
+                {
+                    indices_stats.push(stats);
+                    continue;
+                }
+            }
 
-        let index_type = indices[0].index_type().to_string();
+            let index = self
+                .open_generic_index(&field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
+                .await?;
+
+            if index_typename.is_none() {
+                // Fall back to a friendly name from the type URL if the plugin is unknown
+                let uri = index_uri
+                    .as_deref()
+                    .unwrap_or_else(|| index_details.type_url.as_str());
+                index_typename = Some(type_name_from_uri(uri));
+            }
+
+            indices_stats.push(index.statistics()?);
+        }
+
+        let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
+        let index_type_hint = indices_stats
+            .first()
+            .and_then(|stats| stats.get("index_type"))
+            .and_then(|v| v.as_str());
+        let index_type = legacy_type_name(&index_uri, index_type_hint);
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
 
@@ -1199,6 +1268,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn open_scalar_index(
         &self,
         column: &str,
@@ -1324,12 +1394,11 @@ impl DatasetIndexInternalExt for Dataset {
                     })?;
                 let index_metadata: lance_index::IndexMetadata =
                     serde_json::from_str(index_metadata)?;
-                let field = self.schema().field(column).ok_or_else(|| Error::Index {
-                    message: format!("Column {} does not exist in the schema", column),
-                    location: location!(),
-                })?;
 
-                let (_, element_type) = get_vector_type(self.schema(), column)?;
+                // Resolve the column name and field
+                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
+
+                let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
@@ -1769,6 +1838,49 @@ impl DatasetIndexInternalExt for Dataset {
     }
 }
 
+/// Resolves the column name and field for an index operation.
+///
+/// This function handles the case where the caller passes an index name instead of a column name.
+/// It returns the full field path and the field reference.
+fn resolve_index_column(
+    schema: &LanceSchema,
+    index_meta: &IndexMetadata,
+    column_arg: &str,
+) -> Result<(String, Arc<Field>)> {
+    // First, try to find the column directly in the schema
+    if let Some(field) = schema.field(column_arg) {
+        // Column exists in schema, use it
+        return Ok((column_arg.to_string(), Arc::new(field.clone())));
+    }
+
+    // Column doesn't exist in schema, check if it's the index name
+    if column_arg == index_meta.name {
+        // Get the actual column from index metadata
+        if let Some(field_id) = index_meta.fields.first() {
+            let field = schema.field_by_id(*field_id).ok_or_else(|| Error::Index {
+                message: format!(
+                    "Index '{}' references field with id {} which does not exist in schema",
+                    index_meta.name, field_id
+                ),
+                location: location!(),
+            })?;
+            let field_path = schema.field_path(*field_id)?;
+            return Ok((field_path, Arc::new(field.clone())));
+        } else {
+            return Err(Error::Index {
+                message: format!("Index '{}' has no fields", index_meta.name),
+                location: location!(),
+            });
+        }
+    }
+
+    // Column doesn't exist and is not the index name
+    Err(Error::Index {
+        message: format!("Column '{}' does not exist in the schema", column_arg),
+        location: location!(),
+    })
+}
+
 fn is_vector_field(data_type: DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => true,
@@ -1782,33 +1894,33 @@ fn is_vector_field(data_type: DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow_array::Int32Array;
-
-    use lance_io::{assert_io_eq, assert_io_lt};
-
-    use super::*;
-
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::stream::TryStreamExt;
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+    use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
+    use lance_index::scalar::{
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+    };
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
-
+    use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
@@ -1871,6 +1983,80 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
+        const NUM_ROWS: usize = 500_000;
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Int32,
+            false,
+        )]));
+        let values: Vec<i32> = (0..NUM_ROWS as i32).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+        let io_tracker = dataset.object_store().io_tracker().clone();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["status"],
+                IndexType::Bitmap,
+                Some("status_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index_meta = indices
+            .iter()
+            .find(|idx| idx.name == "status_idx")
+            .expect("status_idx should exist");
+        let lookup_path = dataset
+            .indice_files_dir(index_meta)
+            .unwrap()
+            .child(index_meta.uuid.to_string())
+            .child(BITMAP_LOOKUP_NAME);
+        let meta = dataset.object_store.inner.head(&lookup_path).await.unwrap();
+        assert!(
+            meta.size >= 1_000_000,
+            "bitmap index should be large enough to fail without metadata path, size={} bytes",
+            meta.size
+        );
+
+        // Reset stats collected during index creation
+        io_tracker.incremental_stats();
+
+        dataset.index_statistics("status_idx").await.unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        assert_io_eq!(
+            stats,
+            read_bytes,
+            4096,
+            "index_statistics should only read the index footer; got {} bytes",
+            stats.read_bytes
+        );
+        assert_io_lt!(
+            stats,
+            read_iops,
+            3,
+            "index_statistics should only require a head plus one range read; got {} ops",
+            stats.read_iops
+        );
+        assert_io_eq!(
+            stats,
+            written_bytes,
+            0,
+            "index_statistics should not perform writes"
+        );
     }
 
     fn sample_vector_field() -> Field {
@@ -4807,5 +4993,219 @@ mod tests {
             "Should find at least some documents with 'machine learning'"
         );
         assert!(found_count < num_rows, "Should not match all documents");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column() {
+        use lance_datagen::{array, BatchCount, RowCount};
+
+        // Create a test dataset with a vector column
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(32.into()),
+            )
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index with a custom name
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            4,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_vector_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset to get the index metadata
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index_meta = &indices[0];
+
+        // Test 1: Pass the actual column name
+        let (field_path, field) =
+            resolve_index_column(dataset.schema(), index_meta, "vector").unwrap();
+        assert_eq!(field_path, "vector");
+        assert_eq!(field.name, "vector");
+
+        // Test 2: Pass the index name (should resolve to the actual column)
+        let (field_path2, field2) =
+            resolve_index_column(dataset.schema(), index_meta, "my_vector_index").unwrap();
+        assert_eq!(field_path2, "vector");
+        assert_eq!(field2.name, "vector");
+
+        // Test 3: Pass a non-existent column name (should fail)
+        let result = resolve_index_column(dataset.schema(), index_meta, "nonexistent");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist in the schema"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column_error_cases() {
+        use lance_datagen::{array, BatchCount, RowCount};
+
+        // Create a test dataset
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(32.into()),
+            )
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            4,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index_meta = &indices[0];
+
+        // Test: Pass a column that doesn't exist and is not the index name
+        let result = resolve_index_column(dataset.schema(), index_meta, "nonexistent_column");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist in the schema"),
+            "Error message should mention column doesn't exist, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_index_column_nested_field() {
+        use arrow_array::{RecordBatch, StructArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        // Create a test dataset with nested struct manually
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create schema with nested structure: data.vector
+        let vector_field = ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                8,
+            ),
+            false,
+        );
+        let struct_field = ArrowField::new(
+            "data",
+            DataType::Struct(vec![vector_field.clone()].into()),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            struct_field,
+        ]));
+
+        // Create data
+        let id_array = arrow_array::Int32Array::from(vec![1, 2, 3, 4, 5]);
+
+        // Create nested vector data
+        let mut vector_values = Vec::new();
+        for _ in 0..5 {
+            for _ in 0..8 {
+                vector_values.push(rand::random::<f32>());
+            }
+        }
+        let vector_array = arrow_array::FixedSizeListArray::try_new_from_values(
+            arrow_array::Float32Array::from(vector_values),
+            8,
+        )
+        .unwrap();
+
+        let struct_array = StructArray::from(vec![(
+            Arc::new(vector_field),
+            Arc::new(vector_array) as arrow_array::ArrayRef,
+        )]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(struct_array)],
+        )
+        .unwrap();
+
+        let reader = Box::new(arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)],
+            schema,
+        ));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Create an index on the nested field
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            2,
+            lance_linalg::distance::MetricType::L2,
+        );
+        dataset
+            .create_index(
+                &["data.vector"],
+                IndexType::Vector,
+                Some("nested_vector_index".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset to get the index metadata
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index_meta = &indices[0];
+
+        // Test 1: Pass the nested field path directly
+        let (field_path, field) =
+            resolve_index_column(dataset.schema(), index_meta, "data.vector").unwrap();
+        assert_eq!(field_path, "data.vector");
+        assert_eq!(field.name, "vector");
+
+        // Test 2: Pass the index name, should resolve to the nested field path
+        let (field_path2, field2) =
+            resolve_index_column(dataset.schema(), index_meta, "nested_vector_index").unwrap();
+        assert_eq!(field_path2, "data.vector");
+        assert_eq!(field2.name, "vector");
+
+        // Verify the field path is correct for nested access
+        assert!(
+            field_path2.contains('.'),
+            "Field path should contain '.' for nested field"
+        );
     }
 }

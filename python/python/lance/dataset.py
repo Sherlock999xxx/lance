@@ -1640,12 +1640,11 @@ class LanceDataset(pa.dataset.Dataset):
         if ids is not None:
             lance_blob_files = self._ds.take_blobs(ids, blob_column)
         elif addresses is not None:
-            # ROW ids and Row address are the same until stable ROW ID is implemented.
-            lance_blob_files = self._ds.take_blobs(addresses, blob_column)
+            lance_blob_files = self._ds.take_blobs_by_addresses(addresses, blob_column)
         elif indices is not None:
             lance_blob_files = self._ds.take_blobs_by_indices(indices, blob_column)
         else:
-            raise ValueError("Either ids or indices must be specified")
+            raise ValueError("Either ids, addresses, or indices must be specified")
         return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
@@ -2338,7 +2337,6 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
-            Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
@@ -2407,7 +2405,7 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``FTS/INVERTED``. It is used to index document columns. This index
+        * ``INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
@@ -2427,8 +2425,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
-            ``"INVERTED"`` or ``"BLOOMFILTER"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``, or
+            ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2457,8 +2455,8 @@ class LanceDataset(pa.dataset.Dataset):
             It won't impact the performance of non-phrase queries even if it is set to
             True.
         base_tokenizer: str, default "simple"
-            This is for the ``INVERTED`` index. The base tokenizer to use. The value
-            can be:
+            This is for the ``INVERTED`` index. The base tokenizer to use. The
+            value can be:
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
@@ -2549,7 +2547,7 @@ class LanceDataset(pa.dataset.Dataset):
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" or "BLOOMFILTER" are supported for '
+                        '"INVERTED", or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -2582,7 +2580,7 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED", "FTS"]:
+            elif index_type in ["INVERTED"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
@@ -2797,6 +2795,10 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
+
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
@@ -2881,6 +2883,13 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        if accelerator is not None and index_type != "IVF_PQ":
+            LOGGER.warning(
+                "Index type %s does not support GPU acceleration; falling back to CPU",
+                index_type,
+            )
+            accelerator = None
+
         if accelerator is not None:
             from .vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
