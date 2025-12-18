@@ -73,24 +73,37 @@ impl RabitQuantizer {
         // we don't need to calculate the inverse of P,
         // just take the generated matrix as P^{-1}
         let code_dim = dim * num_bits as i32;
-        let rotate_mat = rotate.then(|| {
-            let rotate_mat = random_orthogonal::<T>(code_dim as usize);
-            let (rotate_mat, _) = rotate_mat.into_raw_vec_and_offset();
+        let rotate_mat = {
+            let values: Vec<T::Native> = if rotate {
+                let rotate_mat = random_orthogonal::<T>(code_dim as usize);
+                let (rotate_mat, _) = rotate_mat.into_raw_vec_and_offset();
+                rotate_mat
+            } else {
+                let zero = T::Native::from_f64(0.0).unwrap();
+                let one = T::Native::from_f64(1.0).unwrap();
+                let code_dim = code_dim as usize;
+                let mut values = Vec::with_capacity(code_dim * code_dim);
+                for i in 0..code_dim {
+                    for j in 0..code_dim {
+                        values.push(if i == j { one } else { zero });
+                    }
+                }
+                values
+            };
 
             match T::FLOAT_TYPE {
                 FloatType::Float16 | FloatType::Float32 | FloatType::Float64 => {
-                    let rotate_mat = T::ArrayType::from(rotate_mat);
+                    let rotate_mat = T::ArrayType::from(values);
                     FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
                 }
                 _ => unimplemented!("RabitQ does not support data type: {:?}", T::FLOAT_TYPE),
             }
-        });
+        };
 
         let metadata = RabitQuantizationMetadata {
-            rotate_mat,
+            rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits,
-            code_dim: code_dim as u32,
             rotate,
             packed: true,
         };
@@ -356,7 +369,11 @@ impl Quantization for RabitQuantizer {
     }
 
     fn code_dim(&self) -> usize {
-        self.metadata.code_dim as usize
+        self.metadata
+            .rotate_mat
+            .as_ref()
+            .expect("rotate_mat not loaded")
+            .len()
     }
 
     fn column(&self) -> &'static str {

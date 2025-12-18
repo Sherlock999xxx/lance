@@ -47,11 +47,6 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
     pub num_bits: u8,
-    /// Code dimension (code_dim = dim * num_bits).
-    ///
-    /// This is stored explicitly so we can support `rotate=false` (no rotation matrix).
-    #[serde(default)]
-    pub code_dim: u32,
     /// Whether to apply a random rotation matrix before quantization.
     #[serde(default = "default_rotate")]
     pub rotate: bool,
@@ -75,7 +70,7 @@ impl DeepSizeOf for RabitQuantizationMetadata {
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
-        self.rotate.then_some(self.rotate_mat_position)
+        Some(self.rotate_mat_position)
     }
 
     fn set_buffer_index(&mut self, index: u32) {
@@ -86,25 +81,19 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
         let rotate_mat = FixedSizeListArray::try_from(&codebook_tensor)?;
-        self.code_dim = rotate_mat.len() as u32;
         self.rotate_mat = Some(rotate_mat);
-        self.rotate = true;
         Ok(())
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        if self.rotate {
-            let inv_p = self
-                .rotate_mat
-                .as_ref()
-                .expect("rotate_mat must be present when rotate=true");
-            let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
-            let mut bytes = BytesMut::new();
-            inv_p_tensor.encode(&mut bytes)?;
-            Ok(Some(bytes.freeze()))
-        } else {
-            Ok(None)
-        }
+        let inv_p = self
+            .rotate_mat
+            .as_ref()
+            .expect("rotate_mat must be present for RabitQ");
+        let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
+        let mut bytes = BytesMut::new();
+        inv_p_tensor.encode(&mut bytes)?;
+        Ok(Some(bytes.freeze()))
     }
 
     async fn load(reader: &PreviousFileReader) -> Result<Self> {
@@ -1059,7 +1048,6 @@ mod tests {
             rotate_mat: None,
             rotate_mat_position: 0,
             num_bits: 1,
-            code_dim: (code_len * (u8::BITS as usize)) as u32,
             rotate: false,
             packed: true,
         };
@@ -1123,7 +1111,6 @@ mod tests {
             rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits: 1,
-            code_dim: dim as u32,
             rotate: true,
             packed: false,
         };
@@ -1131,7 +1118,6 @@ mod tests {
             rotate_mat: None,
             rotate_mat_position: 0,
             num_bits: 1,
-            code_dim: dim as u32,
             rotate: false,
             packed: false,
         };
@@ -1292,7 +1278,6 @@ mod tests {
             rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits,
-            code_dim: (dim * num_bits as usize) as u32,
             rotate: true,
             packed: false,
         };
