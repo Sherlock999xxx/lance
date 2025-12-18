@@ -83,11 +83,19 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RQBuildParams {
     pub num_bits: u8,
+    pub rotate: bool,
 }
 
 impl RQBuildParams {
     pub fn new(num_bits: u8) -> Self {
-        Self { num_bits }
+        Self {
+            num_bits,
+            rotate: true,
+        }
+    }
+
+    pub fn new_with_rotate(num_bits: u8, rotate: bool) -> Self {
+        Self { num_bits, rotate }
     }
 }
 
@@ -99,7 +107,10 @@ impl QuantizerBuildParams for RQBuildParams {
 
 impl Default for RQBuildParams {
     fn default() -> Self {
-        Self { num_bits: 1 }
+        Self {
+            num_bits: 1,
+            rotate: true,
+        }
     }
 }
 

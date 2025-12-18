@@ -30,7 +30,7 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::quantizer::{Quantization, QuantizationType};
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
@@ -167,7 +167,7 @@ impl VectorIndexParams {
 
     pub fn ivf_rq(num_partitions: usize, num_bits: u8, distance_type: DistanceType) -> Self {
         let ivf = IvfBuildParams::new(num_partitions);
-        let rq = RQBuildParams { num_bits };
+        let rq = RQBuildParams::new(num_bits);
         let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
         Self {
             stages,
@@ -1305,6 +1305,7 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
 fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
+        rotate: rabit_quantizer.metadata(None).rotate,
     }
 }
 

@@ -47,8 +47,20 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
     pub num_bits: u8,
+    /// Code dimension (code_dim = dim * num_bits).
+    ///
+    /// This is stored explicitly so we can support `rotate=false` (no rotation matrix).
+    #[serde(default)]
+    pub code_dim: u32,
+    /// Whether to apply a random rotation matrix before quantization.
+    #[serde(default = "default_rotate")]
+    pub rotate: bool,
     /// Whether Rabit codes are stored using the packed SIMD-friendly layout.
     pub packed: bool,
+}
+
+fn default_rotate() -> bool {
+    true
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
@@ -63,7 +75,7 @@ impl DeepSizeOf for RabitQuantizationMetadata {
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
-        Some(self.rotate_mat_position)
+        self.rotate.then_some(self.rotate_mat_position)
     }
 
     fn set_buffer_index(&mut self, index: u32) {
@@ -73,12 +85,19 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
-        self.rotate_mat = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        let rotate_mat = FixedSizeListArray::try_from(&codebook_tensor)?;
+        self.code_dim = rotate_mat.len() as u32;
+        self.rotate_mat = Some(rotate_mat);
+        self.rotate = true;
         Ok(())
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        if let Some(inv_p) = &self.rotate_mat {
+        if self.rotate {
+            let inv_p = self
+                .rotate_mat
+                .as_ref()
+                .expect("rotate_mat must be present when rotate=true");
             let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
             let mut bytes = BytesMut::new();
             inv_p_tensor.encode(&mut bytes)?;
@@ -513,21 +532,40 @@ impl VectorStore for RabitQuantizationStorage {
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        let rotate_mat = self
-            .metadata
-            .rotate_mat
-            .as_ref()
-            .expect("RabitQ metadata not loaded");
+        let rotated_qr: Vec<f32> = if self.metadata.rotate {
+            let rotate_mat = self
+                .metadata
+                .rotate_mat
+                .as_ref()
+                .expect("RabitQ metadata not loaded");
 
-        let rotated_qr = match rotate_mat.value_type() {
-            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
-            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
-            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
-            dt => unimplemented!("RabitQ does not support data type: {}", dt),
+            match rotate_mat.value_type() {
+                DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
+                DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
+                DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
+                dt => unimplemented!("RabitQ does not support data type: {}", dt),
+            }
+        } else {
+            match qr.data_type() {
+                DataType::Float16 => qr
+                    .as_primitive::<Float16Type>()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect(),
+                DataType::Float32 => qr.as_primitive::<Float32Type>().values().to_vec(),
+                DataType::Float64 => qr
+                    .as_primitive::<Float64Type>()
+                    .values()
+                    .iter()
+                    .map(|v| *v as f32)
+                    .collect(),
+                dt => unimplemented!("RabitQ does not support data type: {}", dt),
+            }
         };
 
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
-        let sum_q = rotated_qr.into_iter().sum();
+        let sum_q = rotated_qr.iter().copied().sum();
 
         let q_factor = match self.distance_type {
             DistanceType::L2 => dist_q_c,
@@ -537,8 +575,10 @@ impl VectorStore for RabitQuantizationStorage {
                 self.distance_type
             ),
         };
+        let dim = (self.codes.value_length() as usize) * (u8::BITS as usize)
+            / (self.metadata.num_bits as usize);
         RabitDistCalculator::new(
-            qr.len(),
+            dim,
             self.metadata.num_bits,
             dist_table,
             sum_q,
@@ -1019,6 +1059,8 @@ mod tests {
             rotate_mat: None,
             rotate_mat_position: 0,
             num_bits: 1,
+            code_dim: (code_len * (u8::BITS as usize)) as u32,
+            rotate: false,
             packed: true,
         };
         let storage =
@@ -1038,6 +1080,96 @@ mod tests {
             .to_vec();
         assert_eq!(stored_codes, expected_codes);
         assert!(storage.metadata().packed);
+    }
+
+    #[test]
+    fn test_dist_calculator_rotate_false_matches_identity_rotation() {
+        let dim = 8;
+        let code_len = 1;
+
+        let row_ids = UInt64Array::from(vec![0_u64, 1_u64]);
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0x00, 0xFF]), code_len)
+                .unwrap();
+        let codes_data_type = codes.data_type().clone();
+        let add_factors = Float32Array::from(vec![0.0_f32, 0.0_f32]);
+        let scale_factors = Float32Array::from(vec![1.0_f32, 1.0_f32]);
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
+            arrow_schema::Field::new(RABIT_CODE_COLUMN, codes_data_type, true),
+            arrow_schema::Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+            arrow_schema::Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(row_ids),
+                Arc::new(codes),
+                Arc::new(add_factors),
+                Arc::new(scale_factors),
+            ],
+        )
+        .unwrap();
+
+        let rotate_mat_values: Vec<f32> = (0..dim)
+            .flat_map(|i| (0..dim).map(move |j| if i == j { 1.0 } else { 0.0 }))
+            .collect();
+        let rotate_mat =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(rotate_mat_values), dim)
+                .unwrap();
+
+        let metadata_rotate_true = RabitQuantizationMetadata {
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: 0,
+            num_bits: 1,
+            code_dim: dim as u32,
+            rotate: true,
+            packed: false,
+        };
+        let metadata_rotate_false = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: 0,
+            num_bits: 1,
+            code_dim: dim as u32,
+            rotate: false,
+            packed: false,
+        };
+
+        let storage_rotate_true = RabitQuantizationStorage::try_from_batch(
+            batch.clone(),
+            &metadata_rotate_true,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let storage_rotate_false = RabitQuantizationStorage::try_from_batch(
+            batch,
+            &metadata_rotate_false,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        let qr: ArrayRef = Arc::new(Float32Array::from(vec![
+            0.2_f32, -0.1, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8,
+        ]));
+        let dist_q_c = 0.1234_f32;
+
+        let dist_rotate_true = storage_rotate_true
+            .dist_calculator(qr.clone(), dist_q_c)
+            .distance_all(2);
+        let dist_rotate_false = storage_rotate_false
+            .dist_calculator(qr, dist_q_c)
+            .distance_all(2);
+
+        assert_eq!(dist_rotate_true.len(), dist_rotate_false.len());
+        for (a, b) in dist_rotate_true.iter().zip(dist_rotate_false.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Expected distances to match (rotate=true identity vs rotate=false), got {a} vs {b}"
+            );
+        }
     }
 
     #[test]
@@ -1160,6 +1292,8 @@ mod tests {
             rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits,
+            code_dim: (dim * num_bits as usize) as u32,
+            rotate: true,
             packed: false,
         };
 
