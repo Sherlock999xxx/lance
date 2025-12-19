@@ -186,7 +186,7 @@ impl HNSW {
 
         let bottom_level = HnswBottomView::new(nodes);
         let mut visited = visited_generator.generate(storage.len());
-        Ok(beam_search(
+        let mut results = beam_search(
             &bottom_level,
             &ep,
             params,
@@ -194,10 +194,9 @@ impl HNSW {
             bitset.as_ref(),
             prefetch_distance,
             &mut visited,
-        )
-        .into_iter()
-        .take(k)
-        .collect())
+        );
+        results.sort_unstable_by_key(|node| node.dist);
+        Ok(results.into_iter().take(k).collect())
     }
 
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
@@ -492,7 +491,7 @@ impl HnswBuilder {
     ) -> Vec<OrderedNode> {
         let cur_level = HnswLevelView::new(level, nodes);
         let mut visited = visited_generator.generate(nodes.len());
-        beam_search(
+        let mut results = beam_search(
             &cur_level,
             ep,
             &HnswQueryParams {
@@ -505,7 +504,9 @@ impl HnswBuilder {
             None,
             self.params.prefetch_distance,
             &mut visited,
-        )
+        );
+        results.sort_unstable_by_key(|node| node.dist);
+        results
     }
 
     fn prune(&self, storage: &impl VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
@@ -944,5 +945,34 @@ mod tests {
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
+    }
+
+    #[tokio::test]
+    async fn test_search_basic_sorted_by_distance() {
+        const DIM: usize = 8;
+        const TOTAL: usize = 256;
+        let data = generate_random_array(TOTAL * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(8).ef_construction(40),
+        )
+        .unwrap();
+
+        let query = fsl.value(0);
+        let k = 10;
+        let params = HnswQueryParams {
+            ef: 40,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let results = builder
+            .search_basic(query, k, &params, None, store.as_ref())
+            .unwrap();
+
+        assert_eq!(results.len(), k);
+        assert!(results.windows(2).all(|w| w[0].dist <= w[1].dist));
     }
 }

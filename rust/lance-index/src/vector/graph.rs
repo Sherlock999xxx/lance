@@ -272,7 +272,7 @@ fn process_neighbors_with_look_ahead<F>(
 ///
 /// Returns
 /// -------
-/// A descending sorted list of ``(dist, node_id)`` pairs.
+/// An unordered list of ``(dist, node_id)`` pairs.
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 ///
@@ -352,7 +352,7 @@ pub fn beam_search(
         );
     }
 
-    results.into_sorted_vec()
+    results.into_iter().collect()
 }
 
 /// Greedy search over a graph
