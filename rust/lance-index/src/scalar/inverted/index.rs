@@ -64,7 +64,7 @@ use super::{
 };
 use super::{
     encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
+    iter::PostingListIterator,
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
@@ -895,19 +895,26 @@ impl TokenSet {
         }
     }
 
+    pub(crate) fn into_hash_map(self) -> HashMap<String, u32> {
+        match self.tokens {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+                new_map
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.tokens.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
     }
 
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
@@ -1421,6 +1428,17 @@ impl PostingListReader {
             .reader
             .read_range(0..self.reader.num_rows(), Some(&columns))
             .await?;
+        Ok(batch)
+    }
+
+    pub(crate) async fn read_posting_batch(
+        &self,
+        token_id: u32,
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let range = self.posting_list_range(token_id);
+        let columns = self.posting_columns(with_position);
+        let batch = self.reader.read_range(range, Some(&columns)).await?;
         Ok(batch)
     }
 
@@ -2527,6 +2545,7 @@ mod tests {
     use crate::prefilter::NoFilter;
     use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
+    use crate::scalar::inverted::merger::{Merger, SizeBasedMerger};
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
 
@@ -2631,6 +2650,78 @@ mod tests {
         assert_eq!(builder.docs.len(), 0);
 
         builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_merge_partitions_streaming() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0
+            .posting_lists
+            .push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.docs.append(10, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("beta".to_owned());
+        builder1
+            .posting_lists
+            .push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(2));
+        builder1.docs.append(20, 2);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        let cache = LanceCache::no_cache();
+        let part0 = InvertedPartition::load(
+            store.clone(),
+            0,
+            None,
+            &cache,
+            TokenSetFormat::default(),
+        )
+        .await
+        .unwrap();
+        let part1 = InvertedPartition::load(
+            store.clone(),
+            1,
+            None,
+            &cache,
+            TokenSetFormat::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut merger = SizeBasedMerger::new(
+            store.as_ref(),
+            vec![part0, part1],
+            1024 * 1024,
+            TokenSetFormat::default(),
+        );
+        let merged_parts = merger.merge().await.unwrap();
+        assert_eq!(merged_parts.len(), 1);
+
+        let merged = InvertedPartition::load(
+            store.clone(),
+            merged_parts[0],
+            None,
+            &cache,
+            TokenSetFormat::default(),
+        )
+        .await
+        .unwrap();
+        let tokens = merged.tokens.into_hash_map();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains_key("alpha"));
+        assert!(tokens.contains_key("beta"));
+        assert_eq!(merged.docs.len(), 2);
     }
 
     #[tokio::test]

@@ -8,21 +8,114 @@ use lance_core::{Error, Result};
 use snafu::location;
 use std::sync::Arc;
 
-use crate::scalar::IndexStore;
+use crate::scalar::{IndexStore, IndexWriter};
 
 use super::{
     builder::{
-        doc_file_path, posting_file_path, token_file_path, InnerBuilder, PartitionBatches,
+        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, InnerBuilder,
         PositionRecorder,
     },
     DocSet, InvertedPartition, PostingListBuilder, PostingListReader, TokenSet, TokenSetFormat,
 };
 
-struct MergeInput {
-    tokens: TokenSet,
-    docs: DocSet,
+enum MergeEvent {
+    PartitionStart {
+        tokens: TokenSet,
+        docs: DocSet,
+        inverted_list: Arc<PostingListReader>,
+    },
+    PostingBatch {
+        token_id: u32,
+        batch: RecordBatch,
+    },
+    PartitionEnd,
+}
+
+enum WriteOp {
+    StartPartition { id: u64, with_position: bool },
+    PostingBatch { id: u64, batch: RecordBatch },
+    FinishPartition {
+        id: u64,
+        tokens_batch: RecordBatch,
+        docs_batch: RecordBatch,
+    },
+}
+
+struct PartitionContext {
+    token_map: Vec<u32>,
+    doc_id_offset: u32,
     inverted_list: Arc<PostingListReader>,
-    postings: RecordBatch,
+}
+
+async fn write_partition_ops(
+    store: &dyn IndexStore,
+    receiver: async_channel::Receiver<WriteOp>,
+) -> Result<()> {
+    let mut current_id: Option<u64> = None;
+    let mut posting_writer: Option<Box<dyn IndexWriter>> = None;
+
+    while let Ok(op) = receiver.recv().await {
+        match op {
+            WriteOp::StartPartition { id, with_position } => {
+                if current_id.is_some() {
+                    return Err(Error::Internal {
+                        message: "start received with active partition".to_owned(),
+                        location: location!(),
+                    });
+                }
+                let writer = store
+                    .new_index_file(&posting_file_path(id), inverted_list_schema(with_position))
+                    .await?;
+                current_id = Some(id);
+                posting_writer = Some(writer);
+            }
+            WriteOp::PostingBatch { id, batch } => {
+                if current_id != Some(id) {
+                    return Err(Error::Internal {
+                        message: "posting batch received for inactive partition".to_owned(),
+                        location: location!(),
+                    });
+                }
+                let writer = posting_writer.as_mut().ok_or_else(|| Error::Internal {
+                    message: "posting writer not initialized".to_owned(),
+                    location: location!(),
+                })?;
+                writer.write_record_batch(batch).await?;
+            }
+            WriteOp::FinishPartition {
+                id,
+                tokens_batch,
+                docs_batch,
+            } => {
+                if current_id != Some(id) {
+                    return Err(Error::Internal {
+                        message: "finish received for inactive partition".to_owned(),
+                        location: location!(),
+                    });
+                }
+                let mut writer = posting_writer.take().ok_or_else(|| Error::Internal {
+                    message: "posting writer not initialized".to_owned(),
+                    location: location!(),
+                })?;
+                writer.finish().await?;
+                current_id = None;
+
+                let mut token_writer = store
+                    .new_index_file(&token_file_path(id), tokens_batch.schema())
+                    .await?;
+                token_writer.write_record_batch(tokens_batch).await?;
+                token_writer.finish().await?;
+
+                let mut doc_writer = store
+                    .new_index_file(&doc_file_path(id), docs_batch.schema())
+                    .await?;
+                doc_writer.write_record_batch(docs_batch).await?;
+                doc_writer.finish().await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub trait Merger {
@@ -104,21 +197,16 @@ impl Merger for SizeBasedMerger<'_> {
         );
 
         let num_workers = *crate::scalar::inverted::builder::LANCE_FTS_NUM_SHARDS;
-        let (read_sender, read_receiver) = async_channel::bounded(num_workers);
-        let (partition_sender, partition_receiver) = async_channel::bounded(num_workers);
+        let (read_sender, read_receiver) = async_channel::bounded(2);
 
+        let mut write_senders = Vec::with_capacity(num_workers);
         let mut writer_futures = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let receiver: async_channel::Receiver<PartitionBatches> = partition_receiver.clone();
+            let (sender, receiver) = async_channel::bounded(2);
+            write_senders.push(sender);
             let store = self.dest_store;
-            writer_futures.push(async move {
-                while let Ok(partition) = receiver.recv().await {
-                    partition.write(store).await?;
-                }
-                Result::Ok(())
-            });
+            writer_futures.push(async move { write_partition_ops(store, receiver).await });
         }
-        drop(partition_receiver);
 
         let num_parts = self.input.len();
         let parts = std::mem::take(&mut self.input);
@@ -130,15 +218,38 @@ impl Merger for SizeBasedMerger<'_> {
                     docs,
                     ..
                 } = part;
+                let num_tokens = tokens.len() as u32;
                 let has_positions = inverted_list.has_positions();
-                let postings = inverted_list.read_batch(has_positions).await?;
                 read_sender
-                    .send(MergeInput {
+                    .send(MergeEvent::PartitionStart {
                         tokens,
                         docs,
-                        inverted_list,
-                        postings,
+                        inverted_list: inverted_list.clone(),
                     })
+                    .await
+                    .map_err(|_| Error::Internal {
+                        message: "merge input channel closed".to_owned(),
+                        location: location!(),
+                    })?;
+
+                for token_id in 0..num_tokens {
+                    if inverted_list.posting_len(token_id) == 0 {
+                        continue;
+                    }
+                    let batch = inverted_list
+                        .read_posting_batch(token_id, has_positions)
+                        .await?;
+                    read_sender
+                        .send(MergeEvent::PostingBatch { token_id, batch })
+                        .await
+                        .map_err(|_| Error::Internal {
+                            message: "merge input channel closed".to_owned(),
+                            location: location!(),
+                        })?;
+                }
+
+                read_sender
+                    .send(MergeEvent::PartitionEnd)
                     .await
                     .map_err(|_| Error::Internal {
                         message: "merge input channel closed".to_owned(),
@@ -158,91 +269,142 @@ impl Merger for SizeBasedMerger<'_> {
             let mut builder = InnerBuilder::new(builder_id, with_position, token_set_format);
             let mut estimated_size = builder.docs.size() + builder.tokens.estimated_size();
             let mut parts_merged = 0usize;
+            let mut current: Option<PartitionContext> = None;
 
-            while let Ok(input) = read_receiver.recv_blocking() {
-                if (builder.docs.len() + input.docs.len() > u32::MAX as usize
-                    || estimated_size >= target_size)
-                    && !builder.tokens.is_empty()
-                {
-                    let id = builder.id();
-                    let batches = builder.build_partition_batches()?;
-                    partition_sender
-                        .send_blocking(batches)
-                        .map_err(|_| Error::Internal {
-                            message: "partition channel closed".to_owned(),
+            let send_write_op = |sender: &async_channel::Sender<WriteOp>,
+                                 op: WriteOp|
+             -> Result<()> {
+                sender.send_blocking(op).map_err(|_| Error::Internal {
+                    message: "partition channel closed".to_owned(),
+                    location: location!(),
+                })
+            };
+
+            let flush_builder = |builder: &mut InnerBuilder| -> Result<u64> {
+                let id = builder.id();
+                let docs = Arc::new(std::mem::take(&mut builder.docs));
+                let posting_lists = std::mem::take(&mut builder.posting_lists);
+                let tokens = std::mem::take(&mut builder.tokens);
+                let tokens_batch = tokens.to_batch(token_set_format)?;
+                let docs_batch = docs.to_batch()?;
+
+                let writer_idx = (id as usize) % write_senders.len();
+                let sender = &write_senders[writer_idx];
+                send_write_op(
+                    sender,
+                    WriteOp::StartPartition {
+                        id,
+                        with_position,
+                    },
+                )?;
+                for posting_list in posting_lists {
+                    let block_max_scores = docs.calculate_block_max_scores(
+                        posting_list.doc_ids.iter(),
+                        posting_list.frequencies.iter(),
+                    );
+                    let batch = posting_list.to_batch(block_max_scores)?;
+                    send_write_op(sender, WriteOp::PostingBatch { id, batch })?;
+                }
+                send_write_op(
+                    sender,
+                    WriteOp::FinishPartition {
+                        id,
+                        tokens_batch,
+                        docs_batch,
+                    },
+                )?;
+                Ok(id)
+            };
+
+            while let Ok(event) = read_receiver.recv_blocking() {
+                match event {
+                    MergeEvent::PartitionStart {
+                        tokens,
+                        docs,
+                        inverted_list,
+                    } => {
+                        if (builder.docs.len() + docs.len() > u32::MAX as usize
+                            || estimated_size >= target_size)
+                            && !builder.tokens.is_empty()
+                        {
+                            let id = flush_builder(&mut builder)?;
+                            partitions.push(id);
+                            builder = InnerBuilder::new(id + 1, with_position, token_set_format);
+                            estimated_size = builder.docs.size() + builder.tokens.estimated_size();
+                        }
+
+                        let old_tokens_size = builder.tokens.estimated_size();
+                        let old_docs_size = builder.docs.size();
+
+                        let tokens_len = tokens.len();
+                        let mut token_map = vec![0u32; tokens_len];
+                        for (token, token_id) in tokens.into_hash_map().into_iter() {
+                            let new_id = builder.tokens.add(token);
+                            token_map[token_id as usize] = new_id;
+                        }
+
+                        let doc_id_offset = builder.docs.len() as u32;
+                        for (row_id, num_tokens) in docs.iter() {
+                            builder.docs.append(*row_id, *num_tokens);
+                        }
+
+                        let new_tokens_size = builder.tokens.estimated_size();
+                        let new_docs_size = builder.docs.size();
+                        estimated_size += new_tokens_size - old_tokens_size;
+                        estimated_size += new_docs_size - old_docs_size;
+
+                        builder
+                            .posting_lists
+                            .resize_with(builder.tokens.len(), || {
+                                PostingListBuilder::new(with_position)
+                            });
+
+                        current = Some(PartitionContext {
+                            token_map,
+                            doc_id_offset,
+                            inverted_list,
+                        });
+                    }
+                    MergeEvent::PostingBatch { token_id, batch } => {
+                        let ctx = current.as_ref().ok_or_else(|| Error::Internal {
+                            message: "posting batch received without active partition".to_owned(),
                             location: location!(),
                         })?;
-                    partitions.push(id);
-                    builder = InnerBuilder::new(id + 1, with_position, token_set_format);
-                    estimated_size = builder.docs.size() + builder.tokens.estimated_size();
-                }
-
-                let old_tokens_size = builder.tokens.estimated_size();
-                let old_docs_size = builder.docs.size();
-
-                let mut token_map = vec![0u32; input.tokens.len()];
-                for (token, token_id) in input.tokens.iter() {
-                    let new_id = builder.tokens.add(token);
-                    token_map[token_id as usize] = new_id;
-                }
-
-                let doc_id_offset = builder.docs.len() as u32;
-                for (row_id, num_tokens) in input.docs.iter() {
-                    builder.docs.append(*row_id, *num_tokens);
-                }
-
-                let new_tokens_size = builder.tokens.estimated_size();
-                let new_docs_size = builder.docs.size();
-                estimated_size += new_tokens_size - old_tokens_size;
-                estimated_size += new_docs_size - old_docs_size;
-
-                builder
-                    .posting_lists
-                    .resize_with(builder.tokens.len(), || PostingListBuilder::new(with_position));
-
-                for token_id in 0..input.tokens.len() as u32 {
-                    let range = input.inverted_list.posting_list_range(token_id);
-                    let posting_list_batch =
-                        input.postings.slice(range.start, range.end - range.start);
-                    let posting_list =
-                        input
-                            .inverted_list
-                            .posting_list_from_batch(&posting_list_batch, token_id)?;
-                    let new_token_id = token_map[token_id as usize];
-                    let list_builder = &mut builder.posting_lists[new_token_id as usize];
-                    let old_size = list_builder.size();
-                    for (doc_id, freq, positions) in posting_list.iter() {
-                        let new_doc_id = doc_id_offset + doc_id as u32;
-                        let positions = match positions {
-                            Some(positions) => PositionRecorder::Position(positions.collect()),
-                            None => PositionRecorder::Count(freq),
-                        };
-                        list_builder.add(new_doc_id, positions);
+                        let posting_list =
+                            ctx.inverted_list.posting_list_from_batch(&batch, token_id)?;
+                        let new_token_id = ctx.token_map[token_id as usize];
+                        let list_builder = &mut builder.posting_lists[new_token_id as usize];
+                        let old_size = list_builder.size();
+                        for (doc_id, freq, positions) in posting_list.iter() {
+                            let new_doc_id = ctx.doc_id_offset + doc_id as u32;
+                            let positions = match positions {
+                                Some(positions) => {
+                                    PositionRecorder::Position(positions.collect())
+                                }
+                                None => PositionRecorder::Count(freq),
+                            };
+                            list_builder.add(new_doc_id, positions);
+                        }
+                        let new_size = list_builder.size();
+                        estimated_size += new_size - old_size;
                     }
-                    let new_size = list_builder.size();
-                    estimated_size += new_size - old_size;
-                }
-
-                parts_merged += 1;
-                if parts_merged % 10 == 0 {
-                    log::info!(
-                        "merged {}/{} partitions in {:?}",
-                        parts_merged,
-                        num_parts,
-                        start.elapsed()
-                    );
+                    MergeEvent::PartitionEnd => {
+                        current = None;
+                        parts_merged += 1;
+                        if parts_merged % 10 == 0 {
+                            log::info!(
+                                "merged {}/{} partitions in {:?}",
+                                parts_merged,
+                                num_parts,
+                                start.elapsed()
+                            );
+                        }
+                    }
                 }
             }
 
             if !builder.tokens.is_empty() {
-                let id = builder.id();
-                let batches = builder.build_partition_batches()?;
-                partition_sender
-                    .send_blocking(batches)
-                    .map_err(|_| Error::Internal {
-                        message: "partition channel closed".to_owned(),
-                        location: location!(),
-                    })?;
+                let id = flush_builder(&mut builder)?;
                 partitions.push(id);
             }
             Ok::<Vec<u64>, Error>(partitions)
