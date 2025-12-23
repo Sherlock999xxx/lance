@@ -13,7 +13,7 @@ use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
-use arrow::{array::AsArray, compute::concat_batches};
+use arrow::array::AsArray;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
@@ -43,16 +43,6 @@ use tracing::instrument;
 // WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
-// the (compressed) size of each flush for posting lists in MiB,
-// when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
-// higher for better indexing performance, but more memory usage,
-// it's in 16 MiB by default
-static LANCE_FTS_FLUSH_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_FLUSH_SIZE")
-        .unwrap_or_else(|_| "16".to_string())
-        .parse()
-        .expect("failed to parse LANCE_FTS_FLUSH_SIZE")
-});
 // the number of shards to split the indexing work,
 // the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
 // higher for faster indexing performance, but more memory usage,
@@ -475,9 +465,6 @@ impl InnerBuilder {
 
     fn build_posting_list_batches(&mut self, docs: Arc<DocSet>) -> Result<Vec<RecordBatch>> {
         let posting_lists = std::mem::take(&mut self.posting_lists);
-        let schema = inverted_list_schema(self.with_position);
-        let mut buffer = Vec::new();
-        let mut size_sum = 0;
         let mut batches_out = Vec::new();
         for posting_list in posting_lists {
             let block_max_scores = docs.calculate_block_max_scores(
@@ -485,17 +472,6 @@ impl InnerBuilder {
                 posting_list.frequencies.iter(),
             );
             let batch = posting_list.to_batch(block_max_scores)?;
-            size_sum += batch.get_array_memory_size();
-            buffer.push(batch);
-            if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
-                let batch = concat_batches(&schema, buffer.iter())?;
-                buffer.clear();
-                size_sum = 0;
-                batches_out.push(batch);
-            }
-        }
-        if !buffer.is_empty() {
-            let batch = concat_batches(&schema, buffer.iter())?;
             batches_out.push(batch);
         }
         Ok(batches_out)
@@ -537,8 +513,6 @@ impl InnerBuilder {
             id,
             self.with_position
         );
-        let schema = inverted_list_schema(self.with_position);
-
         let mut batches = stream::iter(posting_lists)
             .map(|posting_list| {
                 let block_max_scores = docs.calculate_block_max_scores(
@@ -551,20 +525,11 @@ impl InnerBuilder {
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        let mut buffer = Vec::new();
-        let mut size_sum = 0;
         while let Some(batch) = batches.try_next().await? {
+            let start = std::time::Instant::now();
+            writer.write_record_batch(batch).await?;
+            write_duration += start.elapsed();
             num_posting_lists += 1;
-            size_sum += batch.get_array_memory_size();
-            buffer.push(batch);
-            if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
-                let batch = concat_batches(&schema, buffer.iter())?;
-                buffer.clear();
-                size_sum = 0;
-                let start = std::time::Instant::now();
-                writer.write_record_batch(batch).await?;
-                write_duration += start.elapsed();
-            }
 
             if num_posting_lists % 500_000 == 0 {
                 log::info!(
@@ -574,10 +539,6 @@ impl InnerBuilder {
                     write_duration,
                 );
             }
-        }
-
-        for batch in buffer {
-            writer.write_record_batch(batch).await?;
         }
         writer.finish().await?;
         Ok(())
