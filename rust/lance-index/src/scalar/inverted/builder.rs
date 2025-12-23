@@ -501,7 +501,7 @@ impl InnerBuilder {
         Ok(batches_out)
     }
 
-    fn build_partition_batches(&mut self) -> Result<PartitionBatches> {
+    pub(crate) fn build_partition_batches(&mut self) -> Result<PartitionBatches> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
         let posting_batches = self.build_posting_list_batches(docs.clone())?;
         let tokens = std::mem::take(&mut self.tokens);
@@ -609,7 +609,7 @@ impl InnerBuilder {
     }
 }
 
-struct PartitionBatches {
+pub(crate) struct PartitionBatches {
     id: u64,
     with_position: bool,
     posting_batches: Vec<RecordBatch>,
@@ -618,7 +618,7 @@ struct PartitionBatches {
 }
 
 impl PartitionBatches {
-    async fn write(self, store: &dyn IndexStore) -> Result<()> {
+    pub(crate) async fn write(self, store: &dyn IndexStore) -> Result<()> {
         let mut posting_writer = store
             .new_index_file(
                 &posting_file_path(self.id),

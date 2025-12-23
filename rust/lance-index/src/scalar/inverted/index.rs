@@ -1458,7 +1458,7 @@ impl PostingListReader {
         Ok(positions.0.clone())
     }
 
-    fn posting_list_range(&self, token_id: u32) -> Range<usize> {
+    pub(crate) fn posting_list_range(&self, token_id: u32) -> Range<usize> {
         match self.offsets {
             Some(ref offsets) => {
                 let offset = offsets[token_id as usize];

@@ -1,16 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-
-use lance_core::Result;
+use arrow_array::RecordBatch;
+use futures::future::try_join_all;
+use lance_core::utils::tokio::spawn_cpu;
+use lance_core::{Error, Result};
+use snafu::location;
+use std::sync::Arc;
 
 use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
-    InvertedPartition, PostingListBuilder, TokenSetFormat,
+    builder::{
+        doc_file_path, posting_file_path, token_file_path, InnerBuilder, PartitionBatches,
+        PositionRecorder,
+    },
+    DocSet, InvertedPartition, PostingListBuilder, PostingListReader, TokenSet, TokenSetFormat,
 };
+
+struct MergeInput {
+    tokens: TokenSet,
+    docs: DocSet,
+    inverted_list: Arc<PostingListReader>,
+    postings: RecordBatch,
+}
 
 pub trait Merger {
     // Merge the partitions and write new partitions,
@@ -61,26 +74,6 @@ impl<'a> SizeBasedMerger<'a> {
             partitions: Vec::new(),
         }
     }
-
-    async fn flush(&mut self) -> Result<()> {
-        if !self.builder.tokens.is_empty() {
-            log::info!("flushing partition {}", self.builder.id());
-            let start = std::time::Instant::now();
-            self.builder.write(self.dest_store).await?;
-            log::info!(
-                "flushed partition {} in {:?}",
-                self.builder.id(),
-                start.elapsed()
-            );
-            self.partitions.push(self.builder.id());
-            self.builder = InnerBuilder::new(
-                self.builder.id() + 1,
-                self.with_position,
-                self.token_set_format,
-            );
-        }
-        Ok(())
-    }
 }
 
 impl Merger for SizeBasedMerger<'_> {
@@ -109,75 +102,154 @@ impl Merger for SizeBasedMerger<'_> {
             self.input.len(),
             self.target_size / 1024 / 1024
         );
-        let mut estimated_size = 0;
-        let start = std::time::Instant::now();
-        let parts = std::mem::take(&mut self.input);
-        let num_parts = parts.len();
-        for (idx, part) in parts.into_iter().enumerate() {
-            // single partition can index up to u32::MAX documents,
-            // or target size is reached
-            if self.builder.docs.len() + part.docs.len() > u32::MAX as usize
-                || estimated_size >= self.target_size
-            {
-                self.flush().await?;
-                estimated_size = 0;
-            }
 
-            let old_tokens_size = self.builder.tokens.estimated_size();
-            let old_docs_size = self.builder.docs.size();
-            let mut inv_token = HashMap::with_capacity(part.tokens.len());
-            // merge token set
-            for (token, token_id) in part.tokens.iter() {
-                self.builder.tokens.add(token.clone());
-                inv_token.insert(token_id, token);
-            }
-            // merge doc set
-            let doc_id_offset = self.builder.docs.len() as u32;
-            for (row_id, num_tokens) in part.docs.iter() {
-                self.builder.docs.append(*row_id, *num_tokens);
-            }
-            let new_tokens_size = self.builder.tokens.estimated_size();
-            let new_docs_size = self.builder.docs.size();
-            estimated_size += new_tokens_size - old_tokens_size;
-            estimated_size += new_docs_size - old_docs_size;
-            // merge posting lists
-            self.builder
-                .posting_lists
-                .resize_with(self.builder.tokens.len(), || {
-                    PostingListBuilder::new(part.inverted_list.has_positions())
-                });
+        let num_workers = *crate::scalar::inverted::builder::LANCE_FTS_NUM_SHARDS;
+        let (read_sender, read_receiver) = async_channel::bounded(num_workers);
+        let (partition_sender, partition_receiver) = async_channel::bounded(num_workers);
 
-            let postings = part
-                .inverted_list
-                .read_batch(part.inverted_list.has_positions())
-                .await?;
-            for token_id in 0..part.tokens.len() as u32 {
-                let posting_list = part
-                    .inverted_list
-                    .posting_list_from_batch(&postings.slice(token_id as usize, 1), token_id)?;
-                let new_token_id = self.builder.tokens.get(&inv_token[&token_id]).unwrap();
-                let builder = &mut self.builder.posting_lists[new_token_id as usize];
-                let old_size = builder.size();
-                for (doc_id, freq, positions) in posting_list.iter() {
-                    let new_doc_id = doc_id_offset + doc_id as u32;
-                    let positions = match positions {
-                        Some(positions) => PositionRecorder::Position(positions.collect()),
-                        None => PositionRecorder::Count(freq),
-                    };
-                    builder.add(new_doc_id, positions);
+        let mut writer_futures = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let receiver: async_channel::Receiver<PartitionBatches> = partition_receiver.clone();
+            let store = self.dest_store;
+            writer_futures.push(async move {
+                while let Ok(partition) = receiver.recv().await {
+                    partition.write(store).await?;
                 }
-                let new_size = builder.size();
-                estimated_size += new_size - old_size;
-            }
-            log::info!(
-                "merged {}/{} partitions in {:?}",
-                idx + 1,
-                num_parts,
-                start.elapsed()
-            );
+                Result::Ok(())
+            });
         }
+        drop(partition_receiver);
 
-        self.flush().await?;
+        let num_parts = self.input.len();
+        let parts = std::mem::take(&mut self.input);
+        let reader = async move {
+            for part in parts {
+                let InvertedPartition {
+                    tokens,
+                    inverted_list,
+                    docs,
+                    ..
+                } = part;
+                let has_positions = inverted_list.has_positions();
+                let postings = inverted_list.read_batch(has_positions).await?;
+                read_sender
+                    .send(MergeInput {
+                        tokens,
+                        docs,
+                        inverted_list,
+                        postings,
+                    })
+                    .await
+                    .map_err(|_| Error::Internal {
+                        message: "merge input channel closed".to_owned(),
+                        location: location!(),
+                    })?;
+            }
+            Ok::<(), Error>(())
+        };
+
+        let with_position = self.with_position;
+        let token_set_format = self.token_set_format;
+        let target_size = self.target_size;
+        let start = std::time::Instant::now();
+        let builder_id = self.builder.id();
+        let cpu = spawn_cpu(move || {
+            let mut partitions = Vec::new();
+            let mut builder = InnerBuilder::new(builder_id, with_position, token_set_format);
+            let mut estimated_size = builder.docs.size() + builder.tokens.estimated_size();
+            let mut parts_merged = 0usize;
+
+            while let Ok(input) = read_receiver.recv_blocking() {
+                if (builder.docs.len() + input.docs.len() > u32::MAX as usize
+                    || estimated_size >= target_size)
+                    && !builder.tokens.is_empty()
+                {
+                    let id = builder.id();
+                    let batches = builder.build_partition_batches()?;
+                    partition_sender
+                        .send_blocking(batches)
+                        .map_err(|_| Error::Internal {
+                            message: "partition channel closed".to_owned(),
+                            location: location!(),
+                        })?;
+                    partitions.push(id);
+                    builder = InnerBuilder::new(id + 1, with_position, token_set_format);
+                    estimated_size = builder.docs.size() + builder.tokens.estimated_size();
+                }
+
+                let old_tokens_size = builder.tokens.estimated_size();
+                let old_docs_size = builder.docs.size();
+
+                let mut token_map = vec![0u32; input.tokens.len()];
+                for (token, token_id) in input.tokens.iter() {
+                    let new_id = builder.tokens.add(token);
+                    token_map[token_id as usize] = new_id;
+                }
+
+                let doc_id_offset = builder.docs.len() as u32;
+                for (row_id, num_tokens) in input.docs.iter() {
+                    builder.docs.append(*row_id, *num_tokens);
+                }
+
+                let new_tokens_size = builder.tokens.estimated_size();
+                let new_docs_size = builder.docs.size();
+                estimated_size += new_tokens_size - old_tokens_size;
+                estimated_size += new_docs_size - old_docs_size;
+
+                builder
+                    .posting_lists
+                    .resize_with(builder.tokens.len(), || PostingListBuilder::new(with_position));
+
+                for token_id in 0..input.tokens.len() as u32 {
+                    let range = input.inverted_list.posting_list_range(token_id);
+                    let posting_list_batch =
+                        input.postings.slice(range.start, range.end - range.start);
+                    let posting_list =
+                        input
+                            .inverted_list
+                            .posting_list_from_batch(&posting_list_batch, token_id)?;
+                    let new_token_id = token_map[token_id as usize];
+                    let list_builder = &mut builder.posting_lists[new_token_id as usize];
+                    let old_size = list_builder.size();
+                    for (doc_id, freq, positions) in posting_list.iter() {
+                        let new_doc_id = doc_id_offset + doc_id as u32;
+                        let positions = match positions {
+                            Some(positions) => PositionRecorder::Position(positions.collect()),
+                            None => PositionRecorder::Count(freq),
+                        };
+                        list_builder.add(new_doc_id, positions);
+                    }
+                    let new_size = list_builder.size();
+                    estimated_size += new_size - old_size;
+                }
+
+                parts_merged += 1;
+                if parts_merged % 10 == 0 {
+                    log::info!(
+                        "merged {}/{} partitions in {:?}",
+                        parts_merged,
+                        num_parts,
+                        start.elapsed()
+                    );
+                }
+            }
+
+            if !builder.tokens.is_empty() {
+                let id = builder.id();
+                let batches = builder.build_partition_batches()?;
+                partition_sender
+                    .send_blocking(batches)
+                    .map_err(|_| Error::Internal {
+                        message: "partition channel closed".to_owned(),
+                        location: location!(),
+                    })?;
+                partitions.push(id);
+            }
+            Ok::<Vec<u64>, Error>(partitions)
+        });
+
+        let ((), partitions, _) = tokio::try_join!(reader, cpu, try_join_all(writer_futures))?;
+        self.partitions = partitions;
         Ok(self.partitions.clone())
     }
 }
