@@ -86,7 +86,7 @@ impl From<&str> for Ref {
 
 impl From<String> for Ref {
     fn from(reference: String) -> Self {
-        Ref::from(reference.as_str())
+        Self::from(reference.as_str())
     }
 }
 
