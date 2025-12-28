@@ -25,7 +25,7 @@ use std::io::ErrorKind;
 pub const MAIN_BRANCH: &str = "main";
 
 /// Lance Ref
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ref {
     // Version number points of the current branch
     VersionNumber(u64),
@@ -35,6 +35,65 @@ pub enum Ref {
     Version(Option<String>, Option<u64>),
     // Tag name points to the global version identifier, could be considered as an alias of specific global version
     Tag(String),
+}
+
+impl std::str::FromStr for Ref {
+    type Err = Error;
+
+    fn from_str(reference: &str) -> std::result::Result<Self, Self::Err> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(Error::InvalidRef {
+                message: "Ref cannot be empty".to_string(),
+            });
+        }
+
+        if let Some((branch, version)) = reference.split_once(':') {
+            if branch.is_empty() {
+                return Err(Error::InvalidRef {
+                    message: "Branch name cannot be empty".to_string(),
+                });
+            }
+
+            let branch = if branch == MAIN_BRANCH {
+                None
+            } else {
+                check_valid_branch(branch)?;
+                Some(branch.to_string())
+            };
+
+            let version = match version {
+                "" | "latest" => None,
+                v => {
+                    let v = v.parse::<u64>().map_err(|e| Error::InvalidRef {
+                        message: format!("Failed to parse version number '{}': {}", v, e),
+                    })?;
+                    Some(v)
+                }
+            };
+
+            return Ok(Self::Version(branch, version));
+        }
+
+        if reference == MAIN_BRANCH {
+            return Ok(Self::Version(None, None));
+        }
+
+        if reference.chars().all(|c| c.is_ascii_digit()) {
+            let v = reference.parse::<u64>().map_err(|e| Error::InvalidRef {
+                message: format!("Failed to parse version number '{}': {}", reference, e),
+            })?;
+            return Ok(Self::VersionNumber(v));
+        }
+
+        if reference.contains('/') {
+            check_valid_branch(reference)?;
+            return Ok(Self::Version(Some(reference.to_string()), None));
+        }
+
+        check_valid_tag(reference)?;
+        Ok(Self::Tag(reference.to_string()))
+    }
 }
 
 impl From<u64> for Ref {
@@ -792,6 +851,41 @@ mod tests {
     use datafusion::common::assert_contains;
 
     use rstest::rstest;
+
+    #[rstest]
+    fn test_parse_ref_ok(
+        #[values(
+            ("0", Ref::VersionNumber(0)),
+            ("42", Ref::VersionNumber(42)),
+            ("main", Ref::Version(None, None)),
+            ("main:", Ref::Version(None, None)),
+            ("main:latest", Ref::Version(None, None)),
+            ("main:10", Ref::Version(None, Some(10))),
+            ("feature/a", Ref::Version(Some("feature/a".to_string()), None)),
+            ("feature/a:", Ref::Version(Some("feature/a".to_string()), None)),
+            ("feature/a:latest", Ref::Version(Some("feature/a".to_string()), None)),
+            ("feature/a:10", Ref::Version(Some("feature/a".to_string()), Some(10))),
+            ("tag1", Ref::Tag("tag1".to_string()))
+    )]
+        (input, expected): (&str, Ref),
+    ) {
+        assert_eq!(input.parse::<Ref>().unwrap(), expected);
+    }
+
+    #[rstest]
+    fn test_parse_ref_err(
+        #[values(
+            "",
+            ":",
+            ":10",
+            "main:bad",
+            "/start-with-slash",
+            "feature//double-slash"
+        )]
+        input: &str,
+    ) {
+        assert!(input.parse::<Ref>().is_err());
+    }
 
     #[rstest]
     fn test_ok_ref(
