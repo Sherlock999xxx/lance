@@ -4,6 +4,7 @@
 pub mod binary;
 #[cfg(feature = "bitpacking")]
 pub mod bitpacking;
+pub mod alp;
 pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
