@@ -4,13 +4,13 @@
 use std::collections::hash_map;
 
 use arrow::array::AsArray;
-use arrow_array::{Array, LargeBinaryArray, ListArray};
+use arrow_array::ListArray;
 use fst::Streamer;
 
 use super::{
     builder::BLOCK_SIZE,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
-    PostingList,
+    PostingBlocks, PostingList,
 };
 
 pub enum TokenSource<'a> {
@@ -82,7 +82,7 @@ pub type PlainPostingListIterator<'a> =
 
 pub struct CompressedPostingListIterator {
     remainder: usize,
-    blocks: LargeBinaryArray,
+    blocks: PostingBlocks,
     next_block_idx: usize,
     positions: Option<ListArray>,
     idx: u32,
@@ -93,7 +93,7 @@ pub struct CompressedPostingListIterator {
 type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<u32>>;
 
 impl CompressedPostingListIterator {
-    pub fn new(length: usize, blocks: LargeBinaryArray, positions: Option<ListArray>) -> Self {
+    pub fn new(length: usize, blocks: PostingBlocks, positions: Option<ListArray>) -> Self {
         debug_assert!(length > 0, "length: {}", length);
         debug_assert_eq!(
             length.div_ceil(BLOCK_SIZE),

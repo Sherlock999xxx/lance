@@ -872,7 +872,7 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, CompressedPostingList, PlainPostingList,
+            encoding::compress_posting_list, CompressedPostingList, PlainPostingList, PostingBlocks,
         },
     };
 
@@ -893,7 +893,7 @@ mod tests {
             )
             .unwrap();
             PostingList::Compressed(CompressedPostingList::new(
-                blocks,
+                PostingBlocks::Array(blocks),
                 max_score,
                 doc_ids.len() as u32,
                 None,

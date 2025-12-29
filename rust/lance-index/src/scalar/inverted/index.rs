@@ -1363,19 +1363,44 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
-        let cache_key = PostingListKey { token_id };
-        let mut posting = self
-            .index_cache
-            .get_or_insert_with_key(cache_key, || async move {
-                metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                let batch = self.posting_batch(token_id, false).await?;
-                self.posting_list_from_batch(&batch, token_id)
-            })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?
-            .as_ref()
-            .clone();
+        let mut posting = if self.offsets.is_some() {
+            let cache_key = PostingListKey { token_id };
+            self.index_cache
+                .get_or_insert_with_key(cache_key, || async move {
+                    metrics.record_part_load();
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                    let batch = self.posting_batch(token_id, false).await?;
+                    self.posting_list_from_batch(&batch, token_id)
+                })
+                .await
+                .map_err(|e| Error::io(e.to_string(), location!()))?
+                .as_ref()
+                .clone()
+        } else {
+            let blocks = self.posting_blocks(token_id, metrics).await?;
+            let max_scores = self.max_scores.as_ref().ok_or(Error::Internal {
+                message: "compressed posting list missing max scores".to_string(),
+                location: location!(),
+            })?;
+            let lengths = self.lengths.as_ref().ok_or(Error::Internal {
+                message: "compressed posting list missing lengths".to_string(),
+                location: location!(),
+            })?;
+            let max_score = *max_scores.get(token_id as usize).ok_or(Error::Internal {
+                message: "token id out of bounds for max scores".to_string(),
+                location: location!(),
+            })?;
+            let length = *lengths.get(token_id as usize).ok_or(Error::Internal {
+                message: "token id out of bounds for lengths".to_string(),
+                location: location!(),
+            })?;
+            PostingList::Compressed(CompressedPostingList::new(
+                PostingBlocks::Cached(blocks),
+                max_score,
+                length,
+                None,
+            ))
+        };
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -1384,6 +1409,76 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    async fn posting_blocks(
+        &self,
+        token_id: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<Arc<Vec<u8>>>> {
+        let lengths = self.lengths.as_ref().ok_or(Error::Internal {
+            message: "compressed posting list missing lengths".to_string(),
+            location: location!(),
+        })?;
+        let length = *lengths.get(token_id as usize).ok_or(Error::Internal {
+            message: "token id out of bounds for lengths".to_string(),
+            location: location!(),
+        })?;
+        let num_blocks = (length as usize).div_ceil(BLOCK_SIZE);
+        if num_blocks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = vec![None; num_blocks];
+        let mut missing = Vec::new();
+        for (block_idx, slot) in blocks.iter_mut().enumerate() {
+            let cache_key = PostingBlockKey {
+                token_id,
+                block_idx: block_idx as u32,
+            };
+            if let Some(block) = self.index_cache.get_with_key(&cache_key).await {
+                *slot = Some(block);
+            } else {
+                missing.push(block_idx);
+            }
+        }
+
+        if !missing.is_empty() {
+            metrics.record_part_load();
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+            let batch = self.posting_batch(token_id, false).await?;
+            let block_list = batch[POSTING_COL].as_list::<i32>();
+            let block_values = block_list.value(0);
+            let block_array = block_values.as_binary::<i64>();
+            debug_assert_eq!(
+                block_array.len(),
+                num_blocks,
+                "token_id: {}, num_blocks: {}, blocks in batch: {}",
+                token_id,
+                num_blocks,
+                block_array.len()
+            );
+
+            for block_idx in missing {
+                let block = Arc::new(block_array.value(block_idx).to_vec());
+                blocks[block_idx] = Some(block.clone());
+                let _ = self
+                    .index_cache
+                    .insert_with_key(
+                        &PostingBlockKey {
+                            token_id,
+                            block_idx: block_idx as u32,
+                        },
+                        block,
+                    )
+                    .await;
+            }
+        }
+
+        Ok(blocks
+            .into_iter()
+            .map(|block| block.expect("posting block should be loaded from cache or storage"))
+            .collect())
     }
 
     pub(crate) fn posting_list_from_batch(
@@ -1405,28 +1500,58 @@ impl PostingListReader {
 
     async fn prewarm(&self) -> Result<()> {
         let batch = self.read_batch(false).await?;
-        for token_id in 0..self.len() {
-            let posting_range = self.posting_list_range(token_id as u32);
-            let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
-            // Apply shrink_to_fit to create a deep copy with compacted buffers
-            // This ensures each cached entry has its own memory, not shared references
-            let batch = batch.shrink_to_fit()?;
-            let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            let inserted = self
-                .index_cache
-                .insert_with_key(
-                    &PostingListKey {
-                        token_id: token_id as u32,
-                    },
-                    Arc::new(posting_list),
-                )
-                .await;
+        if self.offsets.is_some() {
+            for token_id in 0..self.len() {
+                let posting_range = self.posting_list_range(token_id as u32);
+                let batch =
+                    batch.slice(posting_range.start, posting_range.end - posting_range.start);
+                // Apply shrink_to_fit to create a deep copy with compacted buffers
+                // This ensures each cached entry has its own memory, not shared references
+                let batch = batch.shrink_to_fit()?;
+                let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
+                let inserted = self
+                    .index_cache
+                    .insert_with_key(
+                        &PostingListKey {
+                            token_id: token_id as u32,
+                        },
+                        Arc::new(posting_list),
+                    )
+                    .await;
 
-            if !inserted {
-                return Err(Error::Internal {
-                    message: "Failed to prewarm index: cache is no longer available".to_string(),
-                    location: location!(),
-                });
+                if !inserted {
+                    return Err(Error::Internal {
+                        message: "Failed to prewarm index: cache is no longer available"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        } else {
+            let posting_lists = batch[POSTING_COL].as_list::<i32>();
+            for token_id in 0..self.len() {
+                let block_values = posting_lists.value(token_id);
+                let blocks = block_values.as_binary::<i64>();
+                for block_idx in 0..blocks.len() {
+                    let block = Arc::new(blocks.value(block_idx).to_vec());
+                    let inserted = self
+                        .index_cache
+                        .insert_with_key(
+                            &PostingBlockKey {
+                                token_id: token_id as u32,
+                                block_idx: block_idx as u32,
+                            },
+                            block,
+                        )
+                        .await;
+                    if !inserted {
+                        return Err(Error::Internal {
+                            message: "Failed to prewarm index: cache is no longer available"
+                                .to_string(),
+                            location: location!(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1524,6 +1649,20 @@ impl CacheKey for PostingListKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("postings-{}", self.token_id).into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PostingBlockKey {
+    pub token_id: u32,
+    pub block_idx: u32,
+}
+
+impl CacheKey for PostingBlockKey {
+    type ValueType = Vec<u8>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("postings-{}-block-{}", self.token_id, self.block_idx).into()
     }
 }
 
@@ -1758,12 +1897,45 @@ impl PlainPostingList {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum PostingBlocks {
+    Array(LargeBinaryArray),
+    Cached(Vec<Arc<Vec<u8>>>),
+}
+
+impl PostingBlocks {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Array(blocks) => blocks.len(),
+            Self::Cached(blocks) => blocks.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn value(&self, idx: usize) -> &[u8] {
+        match self {
+            Self::Array(blocks) => blocks.value(idx),
+            Self::Cached(blocks) => blocks[idx].as_slice(),
+        }
+    }
+
+    pub fn get_buffer_memory_size(&self) -> usize {
+        match self {
+            Self::Array(blocks) => blocks.get_buffer_memory_size(),
+            Self::Cached(blocks) => blocks.iter().map(|block| block.len()).sum(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct CompressedPostingList {
     pub max_score: f32,
     pub length: u32,
     // each binary is a block of compressed data
     // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
-    pub blocks: LargeBinaryArray,
+    pub blocks: PostingBlocks,
     pub positions: Option<ListArray>,
 }
 
@@ -1780,7 +1952,7 @@ impl DeepSizeOf for CompressedPostingList {
 
 impl CompressedPostingList {
     pub fn new(
-        blocks: LargeBinaryArray,
+        blocks: PostingBlocks,
         max_score: f32,
         length: u32,
         positions: Option<ListArray>,
@@ -1807,7 +1979,7 @@ impl CompressedPostingList {
         Self {
             max_score,
             length,
-            blocks,
+            blocks: PostingBlocks::Array(blocks),
             positions,
         }
     }
@@ -2642,6 +2814,43 @@ mod tests {
         assert_eq!(builder.docs.len(), 0);
 
         builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_posting_block_cache_population() {
+        let tmpdir = TempObjDir::default();
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            cache.clone(),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("block".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        let num_docs = BLOCK_SIZE * 2 + 1;
+        for i in 0..num_docs {
+            builder.posting_lists[0].add(i as u32, PositionRecorder::Count(1));
+            builder.docs.append(i as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let partition =
+            InvertedPartition::load(store, 0, None, cache.as_ref(), TokenSetFormat::default())
+                .await
+                .unwrap();
+
+        cache.clear().await;
+        let _ = partition
+            .inverted_list
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let stats = cache.stats().await;
+        let expected_blocks = num_docs.div_ceil(BLOCK_SIZE);
+        assert_eq!(stats.num_entries, expected_blocks);
     }
 
     #[tokio::test]
