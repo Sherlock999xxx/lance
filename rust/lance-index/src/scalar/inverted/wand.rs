@@ -76,15 +76,34 @@ impl CompressedState {
     }
 
     #[inline]
-    fn decompress(&mut self, block: &[u8], block_idx: usize, num_blocks: usize, length: u32) {
+    fn decompress(
+        &mut self,
+        block: &[u8],
+        block_base: Option<u32>,
+        block_idx: usize,
+        num_blocks: usize,
+        length: u32,
+    ) {
         self.doc_ids.clear();
         self.freqs.clear();
 
         let remainder = length as usize % BLOCK_SIZE;
         if block_idx + 1 == num_blocks && remainder != 0 {
-            decompress_posting_remainder(block, remainder, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_remainder(
+                block,
+                block_base,
+                remainder,
+                &mut self.doc_ids,
+                &mut self.freqs,
+            );
         } else {
-            decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_block(
+                block,
+                block_base,
+                &mut self.buffer,
+                &mut self.doc_ids,
+                &mut self.freqs,
+            );
         }
         self.block_idx = block_idx;
     }
@@ -236,6 +255,8 @@ impl PostingIterator {
                     &mut *compressed.get()
                 };
                 if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
+                    let block_base =
+                        list.block_least_doc_id_for_decode(block_idx, self.metrics.as_ref())?;
                     let block_bytes = if let Some(block) = block_override.as_ref() {
                         super::BlockBytes::Owned(block.clone())
                     } else {
@@ -243,6 +264,7 @@ impl PostingIterator {
                     };
                     compressed.decompress(
                         block_bytes.as_slice(),
+                        block_base,
                         block_idx,
                         list.blocks.len(),
                         list.length,
@@ -931,7 +953,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, CompressedPostingList, PlainPostingList, PostingBlocks,
+            encoding::compress_posting_list, index::BlockMetadataStore, CompressedPostingList,
+            PlainPostingList, PostingBlocks,
         },
     };
 
@@ -942,20 +965,29 @@ mod tests {
         is_compressed: bool,
     ) -> PostingList {
         let freqs = vec![1; doc_ids.len()];
-        let block_max_scores = block_max_scores.unwrap_or_else(|| vec![max_score; doc_ids.len()]);
+        let num_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+        let block_max_scores =
+            block_max_scores.unwrap_or_else(|| vec![max_score; num_blocks]);
         if is_compressed {
-            let blocks = compress_posting_list(
-                doc_ids.len(),
-                doc_ids.iter(),
-                freqs.iter(),
-                block_max_scores.into_iter(),
+            let blocks =
+                compress_posting_list(doc_ids.len(), doc_ids.iter(), freqs.iter()).unwrap();
+            let block_least_doc_ids = doc_ids
+                .iter()
+                .step_by(BLOCK_SIZE)
+                .copied()
+                .collect::<Vec<_>>();
+            let offsets = vec![0, num_blocks];
+            let block_metadata = Arc::new(
+                BlockMetadataStore::new(offsets, block_max_scores, block_least_doc_ids).unwrap(),
             )
+            .for_token(0)
             .unwrap();
             PostingList::Compressed(CompressedPostingList::new(
                 PostingBlocks::Array(blocks),
                 max_score,
                 doc_ids.len() as u32,
                 None,
+                Some(block_metadata),
             ))
         } else {
             PostingList::Plain(PlainPostingList::new(

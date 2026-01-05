@@ -10,6 +10,7 @@ use fst::Streamer;
 use super::{
     builder::BLOCK_SIZE,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
+    index::TokenBlockMetadata,
     PostingBlocks, PostingList,
 };
 
@@ -56,6 +57,7 @@ impl<'a> PostingListIterator<'a> {
                     posting.length as usize,
                     posting.blocks.clone(),
                     posting.positions.clone(),
+                    posting.block_metadata.clone(),
                 )))
             }
         }
@@ -85,6 +87,7 @@ pub struct CompressedPostingListIterator {
     blocks: PostingBlocks,
     next_block_idx: usize,
     positions: Option<ListArray>,
+    block_metadata: Option<TokenBlockMetadata>,
     idx: u32,
     iter: InnerIterator,
     buffer: [u32; BLOCK_SIZE],
@@ -93,7 +96,12 @@ pub struct CompressedPostingListIterator {
 type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<u32>>;
 
 impl CompressedPostingListIterator {
-    pub fn new(length: usize, blocks: PostingBlocks, positions: Option<ListArray>) -> Self {
+    pub(super) fn new(
+        length: usize,
+        blocks: PostingBlocks,
+        positions: Option<ListArray>,
+        block_metadata: Option<TokenBlockMetadata>,
+    ) -> Self {
         debug_assert!(length > 0, "length: {}", length);
         debug_assert_eq!(
             length.div_ceil(BLOCK_SIZE),
@@ -112,6 +120,7 @@ impl CompressedPostingListIterator {
             blocks,
             next_block_idx: 0,
             positions,
+            block_metadata,
             idx: 0,
             iter: std::iter::zip(Vec::new(), Vec::new()),
             buffer: [0; BLOCK_SIZE],
@@ -137,6 +146,7 @@ impl Iterator for CompressedPostingListIterator {
         if self.next_block_idx >= self.blocks.len() {
             return None;
         }
+        let block_idx = self.next_block_idx;
         let compressed = match &self.blocks {
             PostingBlocks::Array(blocks) => blocks.value(self.next_block_idx),
             PostingBlocks::Lazy(_) => unreachable!("CompressedPostingListIterator needs blocks"),
@@ -145,15 +155,26 @@ impl Iterator for CompressedPostingListIterator {
 
         let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
         let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
-        if self.next_block_idx == self.blocks.len() && self.remainder > 0 {
+        let block_base = self
+            .block_metadata
+            .as_ref()
+            .map(|metadata| metadata.block_least_doc_id(block_idx).unwrap());
+        if block_idx + 1 == self.blocks.len() && self.remainder > 0 {
             decompress_posting_remainder(
                 compressed,
+                block_base,
                 self.remainder,
                 &mut doc_ids,
                 &mut frequencies,
             );
         } else {
-            decompress_posting_block(compressed, &mut self.buffer, &mut doc_ids, &mut frequencies);
+            decompress_posting_block(
+                compressed,
+                block_base,
+                &mut self.buffer,
+                &mut doc_ids,
+                &mut frequencies,
+            );
         }
         self.iter = std::iter::zip(doc_ids, frequencies);
         self.next()

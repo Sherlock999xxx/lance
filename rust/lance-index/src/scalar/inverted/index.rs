@@ -100,6 +100,7 @@ pub const POSTING_COL: &str = "_posting";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
+pub const BLOCK_LEAST_DOC_ID_COL: &str = "_block_least_doc_id";
 pub const PREFETCH_PREFIX_NUM_DEFAULT: usize = 16;
 pub const PREFETCH_TOP_NUM_DEFAULT: usize = 32;
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
@@ -422,7 +423,7 @@ impl InvertedIndex {
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.partitions.len() == 1 && self.partitions[0].is_legacy()
+        self.partitions.iter().all(|part| part.is_legacy())
     }
 
     pub async fn load(
@@ -712,7 +713,7 @@ impl InvertedPartition {
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.inverted_list.lengths.is_none()
+        self.inverted_list.is_legacy_format()
     }
 
     pub async fn load(
@@ -1267,7 +1268,7 @@ pub struct PostingListReader {
     lengths: Option<Vec<u32>>,
 
     has_position: bool,
-    has_block_max_scores: bool,
+    block_metadata: Option<Arc<BlockMetadataStore>>,
 
     index_cache: WeakLanceCache,
     block_loader: Arc<PostingBlockLoader>,
@@ -1287,6 +1288,7 @@ impl DeepSizeOf for PostingListReader {
         self.offsets.deep_size_of_children(context)
             + self.max_scores.deep_size_of_children(context)
             + self.lengths.deep_size_of_children(context)
+            + self.block_metadata.deep_size_of_children(context)
     }
 }
 
@@ -1297,7 +1299,8 @@ impl PostingListReader {
         io_parallelism: usize,
     ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
-        let has_block_max_scores = reader.schema().field(BLOCK_MAX_SCORE_COL).is_some();
+        let has_block_metadata = reader.schema().field(BLOCK_MAX_SCORE_COL).is_some()
+            && reader.schema().field(BLOCK_LEAST_DOC_ID_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
             let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
             (Some(offsets), max_scores, None)
@@ -1316,6 +1319,46 @@ impl PostingListReader {
             (None, Some(max_scores), Some(lengths))
         };
 
+        let mut block_metadata = None;
+        if reader.schema().field(POSTING_COL).is_some() && has_block_metadata {
+            let metadata = reader
+                .read_range(
+                    0..reader.num_rows(),
+                    Some(&[BLOCK_MAX_SCORE_COL, BLOCK_LEAST_DOC_ID_COL]),
+                )
+                .await?;
+            let max_scores = metadata[BLOCK_MAX_SCORE_COL].as_list::<i32>();
+            let least_doc_ids = metadata[BLOCK_LEAST_DOC_ID_COL].as_list::<i32>();
+            if max_scores.len() != least_doc_ids.len()
+                || max_scores.offsets() != least_doc_ids.offsets()
+            {
+                return Err(Error::Internal {
+                    message: "block metadata columns have mismatched offsets".to_string(),
+                    location: location!(),
+                });
+            }
+            let offsets = max_scores
+                .offsets()
+                .iter()
+                .map(|offset| *offset as usize)
+                .collect::<Vec<_>>();
+            let max_scores = max_scores
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            let least_doc_ids = least_doc_ids
+                .values()
+                .as_primitive::<UInt32Type>()
+                .values()
+                .to_vec();
+            block_metadata = Some(Arc::new(BlockMetadataStore::new(
+                offsets,
+                max_scores,
+                least_doc_ids,
+            )?));
+        }
+
         let block_loader = Arc::new(PostingBlockLoader::new(
             reader.clone(),
             index_cache,
@@ -1328,7 +1371,7 @@ impl PostingListReader {
             max_scores,
             lengths,
             has_position,
-            has_block_max_scores,
+            block_metadata,
             index_cache: WeakLanceCache::from(index_cache),
             block_loader,
         })
@@ -1367,6 +1410,17 @@ impl PostingListReader {
 
     pub(crate) fn has_positions(&self) -> bool {
         self.has_position
+    }
+
+    pub(crate) fn is_legacy_format(&self) -> bool {
+        self.lengths.is_none() || self.block_metadata.is_none()
+    }
+
+    fn block_metadata_for_token(&self, token_id: u32) -> Result<Option<TokenBlockMetadata>> {
+        if let Some(store) = &self.block_metadata {
+            return store.for_token(token_id).map(Some);
+        }
+        Ok(None)
     }
 
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
@@ -1452,7 +1506,7 @@ impl PostingListReader {
                 .map_err(|e| Error::io(e.to_string(), location!()))?
                 .as_ref()
                 .clone()
-        } else {
+        } else if self.block_metadata.is_some() {
             let max_scores = self.max_scores.as_ref().ok_or(Error::Internal {
                 message: "compressed posting list missing max scores".to_string(),
                 location: location!(),
@@ -1470,6 +1524,20 @@ impl PostingListReader {
                 location: location!(),
             })?;
             let num_blocks = (length as usize).div_ceil(BLOCK_SIZE);
+            let block_metadata = self.block_metadata_for_token(token_id)?;
+            if let Some(metadata) = &block_metadata {
+                if metadata.len() != num_blocks {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "block metadata length {} does not match expected {} for token {}",
+                            metadata.len(),
+                            num_blocks,
+                            token_id
+                        ),
+                        location: location!(),
+                    });
+                }
+            }
             PostingList::Compressed(CompressedPostingList::new(
                 PostingBlocks::Lazy(LazyPostingBlocks::new(
                     token_id,
@@ -1479,10 +1547,17 @@ impl PostingListReader {
                 max_score,
                 length,
                 None,
+                block_metadata,
             ))
+        } else {
+            // old compressed format without block metadata columns; load full posting list
+            metrics.record_part_load();
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+            let batch = self.posting_batch(token_id, is_phrase_query).await?;
+            self.posting_list_from_batch(&batch, token_id)?
         };
 
-        if is_phrase_query {
+        if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
             let positions = self.read_positions(token_id).await?;
             posting.set_positions(positions);
@@ -1492,7 +1567,7 @@ impl PostingListReader {
     }
 
     fn block_request(&self, token_id: u32, block_idx: usize) -> Result<Option<BlockRequest>> {
-        if self.offsets.is_some() {
+        if self.offsets.is_some() || self.block_metadata.is_none() {
             return Ok(None);
         }
         let lengths = self.lengths.as_ref().ok_or(Error::Internal {
@@ -1518,62 +1593,14 @@ impl PostingListReader {
         requests: &[BlockRequest],
         metrics: &dyn MetricsCollector,
     ) -> Result<HashMap<BlockRequest, Arc<Vec<u8>>>> {
-        if requests.is_empty() || self.offsets.is_some() {
+        if requests.is_empty() || self.offsets.is_some() || self.block_metadata.is_none() {
             return Ok(HashMap::new());
         }
         self.block_loader.load_blocks(requests, metrics).await
     }
 
-    async fn block_max_scores(&self, token_id: u32) -> Result<Option<Arc<Vec<f32>>>> {
-        if self.offsets.is_some() || !self.has_block_max_scores {
-            return Ok(None);
-        }
-
-        let cache_key = BlockMaxScoreKey { token_id };
-        let scores = self
-            .index_cache
-            .get_or_insert_with_key(cache_key, || async move {
-                let batch = self
-                    .reader
-                    .read_range(
-                        token_id as usize..token_id as usize + 1,
-                        Some(&[BLOCK_MAX_SCORE_COL]),
-                    )
-                    .await?;
-                let list = batch[BLOCK_MAX_SCORE_COL].as_list::<i32>();
-                if list.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let values = list.value(0);
-                let values = values.as_primitive::<Float32Type>();
-                Ok(values.values().to_vec())
-            })
-            .await?;
-
-        if let Some(lengths) = &self.lengths {
-            let length = *lengths.get(token_id as usize).ok_or(Error::Internal {
-                message: "token id out of bounds for lengths".to_string(),
-                location: location!(),
-            })?;
-            let expected_blocks = (length as usize).div_ceil(BLOCK_SIZE);
-            if scores.len() != expected_blocks {
-                return Err(Error::Internal {
-                    message: format!(
-                        "block max scores length {} does not match expected {} for token {}",
-                        scores.len(),
-                        expected_blocks,
-                        token_id
-                    ),
-                    location: location!(),
-                });
-            }
-        }
-
-        Ok(Some(scores))
-    }
-
     async fn prefetch_requests_for_token(&self, token_id: u32) -> Result<Vec<BlockRequest>> {
-        if self.offsets.is_some() {
+        if self.offsets.is_some() || self.block_metadata.is_none() {
             return Ok(Vec::new());
         }
 
@@ -1591,8 +1618,13 @@ impl PostingListReader {
         }
 
         if *PREFETCH_TOP_NUM > 0 {
-            if let Some(scores) = self.block_max_scores(token_id).await? {
-                let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
+            if let Some(metadata) = self.block_metadata_for_token(token_id)? {
+                let mut ranked = metadata
+                    .block_max_scores()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .collect::<Vec<_>>();
                 ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
                 let top_n = (*PREFETCH_TOP_NUM).min(ranked.len());
                 for (block_idx, _) in ranked.into_iter().take(top_n) {
@@ -1613,7 +1645,7 @@ impl PostingListReader {
         batch: &RecordBatch,
         token_id: u32,
     ) -> Result<PostingList> {
-        let posting_list = PostingList::from_batch(
+        let mut posting_list = PostingList::from_batch(
             batch,
             self.max_scores
                 .as_ref()
@@ -1622,6 +1654,11 @@ impl PostingListReader {
                 .as_ref()
                 .map(|lengths| lengths[token_id as usize]),
         )?;
+        if let Some(metadata) = self.block_metadata_for_token(token_id)? {
+            if let PostingList::Compressed(ref mut posting) = posting_list {
+                posting.block_metadata = Some(metadata);
+            }
+        }
         Ok(posting_list)
     }
 
@@ -1793,23 +1830,146 @@ impl CacheKey for PostingBlockKey {
     }
 }
 
-#[derive(Debug, Clone)]
-struct BlockMaxScoreKey {
-    pub token_id: u32,
-}
-
-impl CacheKey for BlockMaxScoreKey {
-    type ValueType = Vec<f32>;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("postings-{}-block-max-scores", self.token_id).into()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct BlockRequest {
     pub token_id: u32,
     pub block_idx: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct BlockMetadataStore {
+    offsets: Arc<Vec<usize>>,
+    max_scores: Arc<Vec<f32>>,
+    least_doc_ids: Arc<Vec<u32>>,
+}
+
+impl BlockMetadataStore {
+    pub(super) fn new(
+        offsets: Vec<usize>,
+        max_scores: Vec<f32>,
+        least_doc_ids: Vec<u32>,
+    ) -> Result<Self> {
+        if offsets.is_empty() {
+            return Err(Error::Internal {
+                message: "block metadata offsets are empty".to_string(),
+                location: location!(),
+            });
+        }
+        let max_score_len = *offsets.last().unwrap_or(&0);
+        if max_score_len > max_scores.len() || max_score_len > least_doc_ids.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "block metadata offsets exceed values length (offset={}, max_scores={}, least_doc_ids={})",
+                    max_score_len,
+                    max_scores.len(),
+                    least_doc_ids.len()
+                ),
+                location: location!(),
+            });
+        }
+        Ok(Self {
+            offsets: Arc::new(offsets),
+            max_scores: Arc::new(max_scores),
+            least_doc_ids: Arc::new(least_doc_ids),
+        })
+    }
+
+    pub(super) fn for_token(self: &Arc<Self>, token_id: u32) -> Result<TokenBlockMetadata> {
+        let token_idx = token_id as usize;
+        if token_idx + 1 >= self.offsets.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "token id {} out of bounds for block metadata offsets",
+                    token_id
+                ),
+                location: location!(),
+            });
+        }
+        let start = self.offsets[token_idx];
+        let end = self.offsets[token_idx + 1];
+        if end < start {
+            return Err(Error::Internal {
+                message: format!(
+                    "invalid block metadata offsets for token {}: {}..{}",
+                    token_id, start, end
+                ),
+                location: location!(),
+            });
+        }
+        if end > self.max_scores.len() || end > self.least_doc_ids.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "block metadata offsets {}..{} out of bounds for token {}",
+                    start, end, token_id
+                ),
+                location: location!(),
+            });
+        }
+        Ok(TokenBlockMetadata {
+            token_id,
+            start,
+            len: end - start,
+            store: Arc::clone(self),
+        })
+    }
+}
+
+impl DeepSizeOf for BlockMetadataStore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.offsets.deep_size_of_children(context)
+            + self.max_scores.deep_size_of_children(context)
+            + self.least_doc_ids.deep_size_of_children(context)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TokenBlockMetadata {
+    token_id: u32,
+    start: usize,
+    len: usize,
+    store: Arc<BlockMetadataStore>,
+}
+
+impl TokenBlockMetadata {
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn block_max_score(&self, block_idx: usize) -> Result<f32> {
+        if block_idx >= self.len {
+            return Err(Error::Internal {
+                message: format!(
+                    "block index {} out of bounds for token {}",
+                    block_idx, self.token_id
+                ),
+                location: location!(),
+            });
+        }
+        Ok(self.store.max_scores[self.start + block_idx])
+    }
+
+    pub(super) fn block_least_doc_id(&self, block_idx: usize) -> Result<u32> {
+        if block_idx >= self.len {
+            return Err(Error::Internal {
+                message: format!(
+                    "block index {} out of bounds for token {}",
+                    block_idx, self.token_id
+                ),
+                location: location!(),
+            });
+        }
+        Ok(self.store.least_doc_ids[self.start + block_idx])
+    }
+
+    pub(super) fn block_max_scores(&self) -> &[f32] {
+        &self.store.max_scores[self.start..self.start + self.len]
+    }
+}
+
+impl DeepSizeOf for TokenBlockMetadata {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.store.deep_size_of_children(context)
+    }
 }
 
 struct PostingBlockLoader {
@@ -2342,7 +2502,7 @@ impl PostingBlocks {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct CompressedPostingList {
     pub max_score: f32,
     pub length: u32,
@@ -2350,31 +2510,35 @@ pub struct CompressedPostingList {
     // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
     pub blocks: PostingBlocks,
     pub positions: Option<ListArray>,
+    pub(super) block_metadata: Option<TokenBlockMetadata>,
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.blocks.get_buffer_memory_size()
             + self
                 .positions
                 .as_ref()
                 .map(|positions| positions.get_buffer_memory_size())
                 .unwrap_or(0)
+            + self.block_metadata.deep_size_of_children(context)
     }
 }
 
 impl CompressedPostingList {
-    pub fn new(
+    pub(super) fn new(
         blocks: PostingBlocks,
         max_score: f32,
         length: u32,
         positions: Option<ListArray>,
+        block_metadata: Option<TokenBlockMetadata>,
     ) -> Self {
         Self {
             max_score,
             length,
             blocks,
             positions,
+            block_metadata,
         }
     }
 
@@ -2394,6 +2558,7 @@ impl CompressedPostingList {
             length,
             blocks: PostingBlocks::Array(blocks),
             positions,
+            block_metadata: None,
         }
     }
 
@@ -2405,10 +2570,14 @@ impl CompressedPostingList {
             self.length as usize,
             self.blocks.clone(),
             self.positions.clone(),
+            self.block_metadata.clone(),
         )
     }
 
     pub fn block_max_score(&self, block_idx: usize, metrics: &dyn MetricsCollector) -> Result<f32> {
+        if let Some(metadata) = &self.block_metadata {
+            return metadata.block_max_score(block_idx);
+        }
         let block = self.blocks.block(block_idx, metrics)?;
         Ok(block.as_slice()[0..4]
             .try_into()
@@ -2421,11 +2590,26 @@ impl CompressedPostingList {
         block_idx: usize,
         metrics: &dyn MetricsCollector,
     ) -> Result<u32> {
+        if let Some(metadata) = &self.block_metadata {
+            return metadata.block_least_doc_id(block_idx);
+        }
         let block = self.blocks.block(block_idx, metrics)?;
         Ok(block.as_slice()[4..8]
             .try_into()
             .map(u32::from_le_bytes)
             .unwrap())
+    }
+
+    pub fn block_least_doc_id_for_decode(
+        &self,
+        block_idx: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<u32>> {
+        if let Some(metadata) = &self.block_metadata {
+            return metadata.block_least_doc_id(block_idx).map(Some);
+        }
+        let _ = metrics;
+        Ok(None)
     }
 }
 
@@ -2490,13 +2674,28 @@ impl PostingListBuilder {
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
         let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let mut block_least_doc_ids = Vec::with_capacity(block_max_scores.len());
+        for (idx, doc_id) in self.doc_ids.iter().enumerate() {
+            if idx % BLOCK_SIZE == 0 {
+                block_least_doc_ids.push(*doc_id);
+            }
+        }
+        if block_least_doc_ids.len() != block_max_scores.len() {
+            return Err(Error::Internal {
+                message: format!(
+                    "block metadata length mismatch: scores={}, least_doc_ids={}",
+                    block_max_scores.len(),
+                    block_least_doc_ids.len()
+                ),
+                location: location!(),
+            });
+        }
 
         let schema = inverted_list_schema(self.has_positions());
         let compressed = compress_posting_list(
             self.doc_ids.len(),
             self.doc_ids.iter(),
             self.frequencies.iter(),
-            block_max_scores.iter().copied(),
         )?;
         let block_score_offsets =
             OffsetBuffer::new(ScalarBuffer::from(vec![0, block_max_scores.len() as i32]));
@@ -2505,6 +2704,16 @@ impl PostingListBuilder {
             block_score_offsets,
             Arc::new(Float32Array::from_iter_values(
                 block_max_scores.iter().copied(),
+            )),
+            None,
+        )?;
+        let block_least_doc_offsets =
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, block_least_doc_ids.len() as i32]));
+        let block_least_doc_ids = ListArray::try_new(
+            Arc::new(Field::new("item", datatypes::DataType::UInt32, true)),
+            block_least_doc_offsets,
+            Arc::new(UInt32Array::from_iter_values(
+                block_least_doc_ids.into_iter(),
             )),
             None,
         )?;
@@ -2521,6 +2730,7 @@ impl PostingListBuilder {
                 self.len() as u32
             ))) as ArrayRef,
             Arc::new(block_scores) as ArrayRef,
+            Arc::new(block_least_doc_ids) as ArrayRef,
         ];
 
         if let Some(positions) = self.positions.as_ref() {
@@ -3172,12 +3382,19 @@ mod tests {
         // BLOCK_SIZE + 3 elements should be reduced to BLOCK_SIZE + 1,
         // there are still 2 blocks.
         let batch = builder.to_batch(vec![1.0, 2.0]).unwrap();
+        let block_least_doc_ids = expected
+            .doc_ids
+            .iter()
+            .step_by(BLOCK_SIZE)
+            .copied()
+            .collect::<Vec<_>>();
         let (doc_ids, freqs) = decompress_posting_list(
             (n - removed.len()) as u32,
             batch[POSTING_COL]
                 .as_list::<i32>()
                 .value(0)
                 .as_binary::<i64>(),
+            Some(&block_least_doc_ids),
         )
         .unwrap();
         assert!(doc_ids

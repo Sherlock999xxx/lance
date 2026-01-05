@@ -12,19 +12,18 @@ use lance_core::Result;
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
-// each block is:
-// - 4 bytes for the max block score
-// - 4 bytes for the first doc id
-// - 1 byte for the number of bits used to pack the doc ids
-// - n bytes for the packed doc ids
+// Each block stores only compressed data (doc ids + frequencies). Block max score and
+// least doc id are stored in separate columns and are not embedded in the block bytes.
+// Block format (full block):
+// - 1 byte for the number of bits used to pack the doc id deltas
+// - n bytes for the packed doc id deltas (relative to the least doc id)
 // - 1 byte for the number of bits used to pack the frequencies
 // - n bytes for the packed frequencies
-// if the block is not full (the last block), we don't compress it
-// we directly write the remainder to the buffer with the format:
-// - 4 bytes for the max block score
-// - 4*n bytes for the doc ids
+// If the block is not full (the last block), we don't compress it. We directly write
+// the remainder to the buffer with the format:
+// - 4*n bytes for the doc id deltas (relative to the least doc id)
 // - 4*n bytes for the frequencies
-// where n is the number of elements in the block
+// where n is the number of elements in the block.
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -32,18 +31,13 @@ pub fn compress_posting_list<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
     frequencies: impl Iterator<Item = &'a u32>,
-    mut block_max_scores: impl Iterator<Item = f32>,
 ) -> Result<arrow::array::LargeBinaryArray> {
     if length < BLOCK_SIZE {
         // directly do remainder compression to avoid overhead of creating buffer
         let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(
-            doc_ids.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
+        let doc_ids = doc_ids.copied().collect::<Vec<_>>();
+        let base = *doc_ids.first().unwrap_or(&0);
+        compress_remainder_with_base(&doc_ids, base, &mut builder)?;
         compress_remainder(
             frequencies.copied().collect::<Vec<_>>().as_slice(),
             &mut builder,
@@ -66,11 +60,9 @@ pub fn compress_posting_list<'a>(
 
         assert_eq!(doc_id_buffer.len(), BLOCK_SIZE);
 
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        // delta encoding + bitpacking for doc ids
-        compress_sorted_block(&doc_id_buffer, &mut buffer, &mut builder)?;
+        let base = doc_id_buffer[0];
+        // delta encoding + bitpacking for doc ids (relative to base)
+        compress_sorted_block_with_base(base, &doc_id_buffer, &mut buffer, &mut builder)?;
         // bitpacking for frequencies
         compress_block(&freq_buffer, &mut buffer, &mut builder)?;
         builder.append_value("");
@@ -80,10 +72,8 @@ pub fn compress_posting_list<'a>(
 
     // we don't compress the last block if it is not full
     if !doc_id_buffer.is_empty() {
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(&doc_id_buffer, &mut builder)?;
+        let base = doc_id_buffer[0];
+        compress_remainder_with_base(&doc_id_buffer, base, &mut builder)?;
         compress_remainder(&freq_buffer, &mut builder)?;
         builder.append_value("");
     }
@@ -91,15 +81,26 @@ pub fn compress_posting_list<'a>(
 }
 
 #[inline]
-fn compress_sorted_block(
+fn compress_sorted_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuilder) -> Result<()> {
+    let compressor = BitPacker4x::new();
+    let num_bits = compressor.num_bits_sorted(data[0], data);
+    let num_bytes = compressor.compress_sorted(data[0], data, buffer, num_bits);
+    let _ = builder.write(data[0].to_le_bytes().as_ref())?;
+    let _ = builder.write(&[num_bits])?;
+    let _ = builder.write(&buffer[..num_bytes])?;
+    Ok(())
+}
+
+#[inline]
+fn compress_sorted_block_with_base(
+    base: u32,
     data: &[u32],
     buffer: &mut [u8],
     builder: &mut LargeBinaryBuilder,
 ) -> Result<()> {
     let compressor = BitPacker4x::new();
-    let num_bits = compressor.num_bits_sorted(data[0], data);
-    let num_bytes = compressor.compress_sorted(data[0], data, buffer, num_bits);
-    let _ = builder.write(data[0].to_le_bytes().as_ref())?;
+    let num_bits = compressor.num_bits_sorted(base, data);
+    let num_bytes = compressor.compress_sorted(base, data, buffer, num_bits);
     let _ = builder.write(&[num_bits])?;
     let _ = builder.write(&buffer[..num_bytes])?;
     Ok(())
@@ -119,6 +120,19 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
 fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
     for value in data.iter() {
         let _ = builder.write(value.to_le_bytes().as_ref())?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn compress_remainder_with_base(
+    data: &[u32],
+    base: u32,
+    builder: &mut LargeBinaryBuilder,
+) -> Result<()> {
+    for value in data.iter() {
+        let delta = value - base;
+        let _ = builder.write(delta.to_le_bytes().as_ref())?;
     }
     Ok(())
 }
@@ -157,21 +171,36 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 pub fn decompress_posting_list(
     num_docs: u32,
     posting_list: &arrow::array::LargeBinaryArray,
+    block_least_doc_ids: Option<&[u32]>,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let mut doc_ids: Vec<u32> = Vec::with_capacity(num_docs as usize);
     let mut frequencies: Vec<u32> = Vec::with_capacity(num_docs as usize);
 
     let mut buffer = [0u32; BLOCK_SIZE];
     let bitpacking_blocks = num_docs as usize / BLOCK_SIZE;
-    for compressed in posting_list.iter().take(bitpacking_blocks) {
+    for (block_idx, compressed) in posting_list.iter().take(bitpacking_blocks).enumerate() {
         let compressed = compressed.unwrap();
-        decompress_posting_block(compressed, &mut buffer, &mut doc_ids, &mut frequencies);
+        let base = block_least_doc_ids.map(|ids| ids[block_idx]);
+        decompress_posting_block(
+            compressed,
+            base,
+            &mut buffer,
+            &mut doc_ids,
+            &mut frequencies,
+        );
     }
 
     let remainder = num_docs as usize % BLOCK_SIZE;
     if remainder > 0 {
         let compressed = posting_list.value(bitpacking_blocks);
-        decompress_posting_remainder(compressed, remainder, &mut doc_ids, &mut frequencies);
+        let base = block_least_doc_ids.map(|ids| ids[bitpacking_blocks]);
+        decompress_posting_remainder(
+            compressed,
+            base,
+            remainder,
+            &mut doc_ids,
+            &mut frequencies,
+        );
     }
 
     Ok((doc_ids, frequencies))
@@ -218,25 +247,40 @@ pub fn read_num_positions(compressed: &arrow::array::LargeBinaryArray) -> u32 {
 
 pub fn decompress_posting_block(
     block: &[u8],
+    block_base: Option<u32>,
     buffer: &mut [u32; BLOCK_SIZE],
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
-    // skip the first 4 bytes for the max block score
-    let block = &block[4..];
-    let num_bytes = decompress_sorted_block(block, buffer, doc_ids);
+    let (block, base) = match block_base {
+        Some(base) => (block, base),
+        None => {
+            let base = u32::from_le_bytes(block[4..8].try_into().unwrap());
+            (&block[8..], base)
+        }
+    };
+    let num_bytes = decompress_sorted_block_with_base(block, base, buffer, doc_ids);
     decompress_block(&block[num_bytes..], buffer, frequencies);
 }
 
 pub fn decompress_posting_remainder(
     block: &[u8],
+    block_base: Option<u32>,
     n: usize,
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
-    let block = &block[4..];
-    decompress_remainder(block, n, doc_ids);
-    decompress_remainder(&block[n * 4..], n, frequencies);
+    match block_base {
+        Some(base) => {
+            decompress_remainder_with_base(block, base, n, doc_ids);
+            decompress_remainder(&block[n * 4..], n, frequencies);
+        }
+        None => {
+            let block = &block[4..];
+            decompress_remainder(block, n, doc_ids);
+            decompress_remainder(&block[n * 4..], n, frequencies);
+        }
+    }
 }
 
 pub fn decompress_sorted_block(
@@ -252,6 +296,19 @@ pub fn decompress_sorted_block(
     5 + num_bytes
 }
 
+pub fn decompress_sorted_block_with_base(
+    block: &[u8],
+    base: u32,
+    buffer: &mut [u32; BLOCK_SIZE],
+    res: &mut Vec<u32>,
+) -> usize {
+    let compressor = BitPacker4x::new();
+    let num_bits = block[0];
+    let num_bytes = compressor.decompress_sorted(base, &block[1..], buffer, num_bits);
+    res.extend_from_slice(&buffer[..]);
+    1 + num_bytes
+}
+
 fn decompress_block(block: &[u8], buffer: &mut [u32; BLOCK_SIZE], res: &mut Vec<u32>) {
     let compressor = BitPacker4x::new();
     let num_bits = block[0];
@@ -263,6 +320,18 @@ pub fn decompress_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
     for bytes in compressed.chunks_exact(4).take(n) {
         let data = u32::from_le_bytes(bytes.try_into().unwrap());
         dest.push(data);
+    }
+}
+
+pub fn decompress_remainder_with_base(
+    compressed: &[u8],
+    base: u32,
+    n: usize,
+    dest: &mut Vec<u32>,
+) {
+    for bytes in compressed.chunks_exact(4).take(n) {
+        let data = u32::from_le_bytes(bytes.try_into().unwrap());
+        dest.push(data + base);
     }
 }
 
@@ -284,13 +353,10 @@ mod tests {
         let frequencies: Vec<u32> = (0..num_rows)
             .map(|_| rng.random_range(1..=u32::MAX))
             .collect();
-        let block_max_scores =
-            (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.random_range(0.0..1.0));
         let posting_list = compress_posting_list(
             doc_ids.len(),
             doc_ids.iter(),
             frequencies.iter(),
-            block_max_scores,
         )?;
         assert_eq!(posting_list.len(), num_rows.div_ceil(BLOCK_SIZE));
         let compressed_size =
@@ -303,8 +369,13 @@ mod tests {
             original_size
         );
 
+        let block_least_doc_ids = doc_ids
+            .iter()
+            .step_by(BLOCK_SIZE)
+            .copied()
+            .collect::<Vec<_>>();
         let (decompressed_doc_ids, decompressed_frequencies) =
-            decompress_posting_list(num_rows as u32, &posting_list)?;
+            decompress_posting_list(num_rows as u32, &posting_list, Some(&block_least_doc_ids))?;
         assert_eq!(doc_ids, decompressed_doc_ids);
         assert_eq!(frequencies, decompressed_frequencies);
         Ok(())
