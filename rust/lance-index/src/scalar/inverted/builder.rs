@@ -14,7 +14,7 @@ use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
-use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
@@ -330,6 +330,12 @@ impl InvertedIndexBuilder {
                 self.src_store
                     .copy_index_file(&posting_file_path(*part), dest_store)
                     .await?;
+                copy_index_file_if_exists(
+                    self.src_store.as_ref(),
+                    &block_file_path(*part),
+                    dest_store,
+                )
+                .await?;
                 self.src_store
                     .copy_index_file(&doc_file_path(*part), dest_store)
                     .await?;
@@ -341,6 +347,12 @@ impl InvertedIndexBuilder {
                 self.local_store
                     .copy_index_file(&posting_file_path(*part), dest_store)
                     .await?;
+                copy_index_file_if_exists(
+                    self.local_store.as_ref(),
+                    &block_file_path(*part),
+                    dest_store,
+                )
+                .await?;
                 self.local_store
                     .copy_index_file(&doc_file_path(*part), dest_store)
                     .await?;
@@ -480,6 +492,10 @@ impl InnerBuilder {
                 inverted_list_schema(self.with_position),
             )
             .await?;
+        let block_schema = block_table_schema();
+        let mut block_writer = store
+            .new_index_file(&block_file_path(self.id), block_schema.clone())
+            .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
 
         log::info!(
@@ -510,10 +526,12 @@ impl InnerBuilder {
             buffer.push(batch);
             if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
                 let batch = concat_batches(&schema, buffer.iter())?;
+                let block_batch = block_batch_from_posting_batch(&batch, &block_schema)?;
                 buffer.clear();
                 size_sum = 0;
                 let start = std::time::Instant::now();
                 writer.write_record_batch(batch).await?;
+                block_writer.write_record_batch(block_batch).await?;
                 write_duration += start.elapsed();
             }
 
@@ -528,10 +546,13 @@ impl InnerBuilder {
         }
         if !buffer.is_empty() {
             let batch = concat_batches(&schema, buffer.iter())?;
+            let block_batch = block_batch_from_posting_batch(&batch, &block_schema)?;
             writer.write_record_batch(batch).await?;
+            block_writer.write_record_batch(block_batch).await?;
         }
 
         writer.finish().await?;
+        block_writer.finish().await?;
         Ok(())
     }
 
@@ -836,6 +857,35 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
+fn block_table_schema() -> SchemaRef {
+    Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        BLOCK_COL,
+        datatypes::DataType::LargeBinary,
+        false,
+    )]))
+}
+
+fn block_batch_from_posting_batch(
+    batch: &RecordBatch,
+    block_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let blocks = batch[POSTING_COL].as_list::<i32>();
+    let values = blocks.values().as_binary::<i64>().clone();
+    RecordBatch::try_new(block_schema.clone(), vec![Arc::new(values) as ArrayRef]).map_err(Into::into)
+}
+
+pub(crate) async fn copy_index_file_if_exists(
+    store: &dyn IndexStore,
+    name: &str,
+    dest_store: &dyn IndexStore,
+) -> Result<()> {
+    match store.copy_index_file(name, dest_store).await {
+        Ok(()) => Ok(()),
+        Err(Error::NotFound { .. }) | Err(Error::IndexNotFound { .. }) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Flatten the string list stream into a string stream
 pub struct FlattenStream {
     /// Inner record batch stream with 2 columns:
@@ -968,6 +1018,10 @@ pub(crate) fn token_file_path(partition_id: u64) -> String {
 
 pub(crate) fn posting_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, INVERT_LIST_FILE)
+}
+
+pub(crate) fn block_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, BLOCKS_FILE)
 }
 
 pub(crate) fn doc_file_path(partition_id: u64) -> String {
@@ -1298,6 +1352,7 @@ mod tests {
         for id in &partitions {
             dest_store.open_index_file(&token_file_path(*id)).await?;
             dest_store.open_index_file(&posting_file_path(*id)).await?;
+            dest_store.open_index_file(&block_file_path(*id)).await?;
             dest_store.open_index_file(&doc_file_path(*id)).await?;
         }
 

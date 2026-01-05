@@ -50,8 +50,8 @@ use tracing::{info, instrument};
 
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        block_file_path, doc_file_path, inverted_list_schema, posting_file_path, token_file_path,
+        ScoredDoc, BLOCK_SIZE,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -81,10 +81,12 @@ use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
-// Version 1: Fst TokenSetFormat (new default, incompatible clients < 0.38)
-pub const INVERTED_INDEX_VERSION: u32 = 1;
+// Version 1: Fst TokenSetFormat with block metadata stored in block bytes (legacy)
+// Version 2: Fst TokenSetFormat with block metadata stored in columns + block table
+pub const INVERTED_INDEX_VERSION: u32 = 2;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
+pub const BLOCKS_FILE: &str = "blocks.lance";
 pub const DOCS_FILE: &str = "docs.lance";
 pub const METADATA_FILE: &str = "metadata.lance";
 
@@ -97,6 +99,7 @@ pub const FREQUENCY_COL: &str = "_frequency";
 pub const POSITION_COL: &str = "_position";
 pub const COMPRESSED_POSITION_COL: &str = "_compressed_position";
 pub const POSTING_COL: &str = "_posting";
+pub const BLOCK_COL: &str = "_block";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
@@ -384,6 +387,7 @@ impl InvertedIndex {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
                 let invert_list = PostingListReader::try_new(
                     invert_list_reader,
+                    None,
                     &index_cache_clone,
                     store.io_parallelism(),
                 )
@@ -726,9 +730,18 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list =
-            PostingListReader::try_new(invert_list_file, index_cache, store.io_parallelism())
-                .await?;
+        let block_file = match store.open_index_file(&block_file_path(id)).await {
+            Ok(reader) => Some(reader),
+            Err(Error::NotFound { .. }) | Err(Error::IndexNotFound { .. }) => None,
+            Err(err) => return Err(err),
+        };
+        let inverted_list = PostingListReader::try_new(
+            invert_list_file,
+            block_file,
+            index_cache,
+            store.io_parallelism(),
+        )
+        .await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
 
@@ -1271,7 +1284,7 @@ pub struct PostingListReader {
     block_metadata: Option<Arc<BlockMetadataStore>>,
 
     index_cache: WeakLanceCache,
-    block_loader: Arc<PostingBlockLoader>,
+    block_loader: Option<Arc<PostingBlockLoader>>,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -1295,6 +1308,7 @@ impl DeepSizeOf for PostingListReader {
 impl PostingListReader {
     pub(crate) async fn try_new(
         reader: Arc<dyn IndexReader>,
+        block_reader: Option<Arc<dyn IndexReader>>,
         index_cache: &LanceCache,
         io_parallelism: usize,
     ) -> Result<Self> {
@@ -1320,7 +1334,7 @@ impl PostingListReader {
         };
 
         let mut block_metadata = None;
-        if reader.schema().field(POSTING_COL).is_some() && has_block_metadata {
+        if has_block_metadata {
             let metadata = reader
                 .read_range(
                     0..reader.num_rows(),
@@ -1359,11 +1373,29 @@ impl PostingListReader {
             )?));
         }
 
-        let block_loader = Arc::new(PostingBlockLoader::new(
-            reader.clone(),
-            index_cache,
-            io_parallelism,
-        ));
+        let block_loader = if let (Some(block_reader), Some(metadata)) =
+            (block_reader, block_metadata.clone())
+        {
+            let expected_blocks = metadata.total_blocks();
+            if block_reader.num_rows() != expected_blocks {
+                return Err(Error::Internal {
+                    message: format!(
+                        "block table row count {} does not match expected {}",
+                        block_reader.num_rows(),
+                        expected_blocks
+                    ),
+                    location: location!(),
+                });
+            }
+            Some(Arc::new(PostingBlockLoader::new(
+                block_reader,
+                metadata,
+                index_cache,
+                io_parallelism,
+            )))
+        } else {
+            None
+        };
 
         Ok(Self {
             reader,
@@ -1538,17 +1570,24 @@ impl PostingListReader {
                     });
                 }
             }
-            PostingList::Compressed(CompressedPostingList::new(
-                PostingBlocks::Lazy(LazyPostingBlocks::new(
-                    token_id,
-                    num_blocks,
-                    self.block_loader.clone(),
-                )),
-                max_score,
-                length,
-                None,
-                block_metadata,
-            ))
+            if let Some(block_loader) = self.block_loader.as_ref() {
+                PostingList::Compressed(CompressedPostingList::new(
+                    PostingBlocks::Lazy(LazyPostingBlocks::new(
+                        token_id,
+                        num_blocks,
+                        block_loader.clone(),
+                    )),
+                    max_score,
+                    length,
+                    None,
+                    block_metadata,
+                ))
+            } else {
+                metrics.record_part_load();
+                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                let batch = self.posting_batch(token_id, is_phrase_query).await?;
+                self.posting_list_from_batch(&batch, token_id)?
+            }
         } else {
             // old compressed format without block metadata columns; load full posting list
             metrics.record_part_load();
@@ -1593,10 +1632,15 @@ impl PostingListReader {
         requests: &[BlockRequest],
         metrics: &dyn MetricsCollector,
     ) -> Result<HashMap<BlockRequest, Arc<Vec<u8>>>> {
-        if requests.is_empty() || self.offsets.is_some() || self.block_metadata.is_none() {
+        let block_loader = if self.offsets.is_some() || self.block_metadata.is_none() {
+            None
+        } else {
+            self.block_loader.as_ref()
+        };
+        if requests.is_empty() || block_loader.is_none() {
             return Ok(HashMap::new());
         }
-        self.block_loader.load_blocks(requests, metrics).await
+        block_loader.unwrap().load_blocks(requests, metrics).await
     }
 
     async fn prefetch_requests_for_token(&self, token_id: u32) -> Result<Vec<BlockRequest>> {
@@ -1912,6 +1956,10 @@ impl BlockMetadataStore {
             store: Arc::clone(self),
         })
     }
+
+    pub(super) fn total_blocks(&self) -> usize {
+        *self.offsets.last().unwrap_or(&0)
+    }
 }
 
 impl DeepSizeOf for BlockMetadataStore {
@@ -1933,6 +1981,10 @@ pub(super) struct TokenBlockMetadata {
 impl TokenBlockMetadata {
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    pub(super) fn start_offset(&self) -> usize {
+        self.start
     }
 
     pub(super) fn block_max_score(&self, block_idx: usize) -> Result<f32> {
@@ -1973,7 +2025,8 @@ impl DeepSizeOf for TokenBlockMetadata {
 }
 
 struct PostingBlockLoader {
-    reader: Arc<dyn IndexReader>,
+    block_reader: Arc<dyn IndexReader>,
+    block_metadata: Arc<BlockMetadataStore>,
     index_cache: WeakLanceCache,
     io_parallelism: usize,
     runtime: tokio::runtime::Handle,
@@ -1988,9 +2041,15 @@ impl std::fmt::Debug for PostingBlockLoader {
 }
 
 impl PostingBlockLoader {
-    fn new(reader: Arc<dyn IndexReader>, index_cache: &LanceCache, io_parallelism: usize) -> Self {
+    fn new(
+        block_reader: Arc<dyn IndexReader>,
+        block_metadata: Arc<BlockMetadataStore>,
+        index_cache: &LanceCache,
+        io_parallelism: usize,
+    ) -> Self {
         Self {
-            reader,
+            block_reader,
+            block_metadata,
             index_cache: WeakLanceCache::from(index_cache),
             io_parallelism: io_parallelism.max(1),
             runtime: tokio::runtime::Handle::current(),
@@ -2028,43 +2087,78 @@ impl PostingBlockLoader {
             return Ok(results);
         }
 
-        let reader = self.reader.clone();
+        let reader = self.block_reader.clone();
+        let block_metadata = self.block_metadata.clone();
         let index_cache = self.index_cache.clone();
         let io_parallelism = self.io_parallelism;
         let fetched = stream::iter(missing.into_iter())
             .map(|(token_id, mut block_indices)| {
                 let reader = reader.clone();
+                let block_metadata = block_metadata.clone();
                 let index_cache = index_cache.clone();
                 async move {
                     block_indices.sort_unstable();
                     block_indices.dedup();
-                    metrics.record_part_load();
-                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                    let batch = reader
-                        .read_range(token_id as usize..token_id as usize + 1, Some(&[POSTING_COL]))
-                        .await?;
-                    let block_list = batch[POSTING_COL].as_list::<i32>();
-                    let block_values = block_list.value(0);
-                    let block_array = block_values.as_binary::<i64>();
-                    let num_blocks = block_array.len();
+                    let metadata = block_metadata.for_token(token_id)?;
+                    let num_blocks = metadata.len();
                     let mut loaded = Vec::with_capacity(block_indices.len());
-                    for block_idx in block_indices {
-                        if block_idx >= num_blocks {
+                    if num_blocks == 0 {
+                        return Ok(loaded);
+                    }
+                    let mut ranges = Vec::new();
+                    let mut range_start = block_indices[0];
+                    let mut range_end = block_indices[0];
+                    for &block_idx in block_indices.iter().skip(1) {
+                        if block_idx == range_end + 1 {
+                            range_end = block_idx;
+                        } else {
+                            ranges.push((range_start, range_end));
+                            range_start = block_idx;
+                            range_end = block_idx;
+                        }
+                    }
+                    ranges.push((range_start, range_end));
+
+                    for (range_start, range_end) in ranges {
+                        if range_end >= num_blocks {
                             return Err(Error::Internal {
                                 message: format!(
                                     "block index {} out of bounds for token {}",
-                                    block_idx, token_id
+                                    range_end, token_id
                                 ),
                                 location: location!(),
                             });
                         }
-                        let block = Arc::new(block_array.value(block_idx).to_vec());
-                        let cache_key = PostingBlockKey {
-                            token_id,
-                            block_idx: block_idx as u32,
-                        };
-                        let _ = index_cache.insert_with_key(&cache_key, block.clone()).await;
-                        loaded.push((BlockRequest { token_id, block_idx }, block));
+                        let token_start = metadata.start_offset();
+                        let global_start = token_start + range_start;
+                        let global_end = token_start + range_end + 1;
+                        metrics.record_part_load();
+                        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                        let batch = reader
+                            .read_range(global_start..global_end, Some(&[BLOCK_COL]))
+                            .await?;
+                        let block_array = batch[BLOCK_COL].as_binary::<i64>();
+                        let expected_len = range_end - range_start + 1;
+                        if block_array.len() != expected_len {
+                            return Err(Error::Internal {
+                                message: format!(
+                                    "block table returned {} rows for token {} (expected {})",
+                                    block_array.len(),
+                                    token_id,
+                                    expected_len
+                                ),
+                                location: location!(),
+                            });
+                        }
+                        for (offset, block_idx) in (range_start..=range_end).enumerate() {
+                            let block = Arc::new(block_array.value(offset).to_vec());
+                            let cache_key = PostingBlockKey {
+                                token_id,
+                                block_idx: block_idx as u32,
+                            };
+                            let _ = index_cache.insert_with_key(&cache_key, block.clone()).await;
+                            loaded.push((BlockRequest { token_id, block_idx }, block));
+                        }
                     }
                     Result::Ok(loaded)
                 }
@@ -3557,7 +3651,7 @@ mod tests {
 
         let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
         let posting_reader =
-            PostingListReader::try_new(reader, cache.as_ref(), store.io_parallelism())
+            PostingListReader::try_new(reader, None, cache.as_ref(), store.io_parallelism())
                 .await
                 .unwrap();
 

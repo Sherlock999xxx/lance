@@ -8,7 +8,10 @@ use lance_core::Result;
 use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
+    builder::{
+        block_file_path, copy_index_file_if_exists, doc_file_path, posting_file_path,
+        token_file_path, InnerBuilder, PositionRecorder,
+    },
     InvertedPartition, PostingListBuilder, TokenSetFormat,
 };
 
@@ -93,6 +96,12 @@ impl Merger for SizeBasedMerger<'_> {
                 part.store()
                     .copy_index_file(&posting_file_path(part.id()), self.dest_store)
                     .await?;
+                copy_index_file_if_exists(
+                    part.store(),
+                    &block_file_path(part.id()),
+                    self.dest_store,
+                )
+                .await?;
                 part.store()
                     .copy_index_file(&doc_file_path(part.id()), self.dest_store)
                     .await?;
