@@ -76,6 +76,7 @@ bytes = "1.4"
 default = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+uring = ["lance/uring"]
 rest = ["lance-namespace-impls/rest"]
 rest-adapter = ["lance-namespace-impls/rest-adapter"]
 # Credential vending features for DirectoryNamespace

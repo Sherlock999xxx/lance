@@ -137,6 +137,7 @@ oss = ["lance-io/oss"]
 huggingface = ["lance-io/huggingface"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+uring = ["lance-io/uring", "lance-file/uring"]
 
 [[bin]]
 name = "lq"

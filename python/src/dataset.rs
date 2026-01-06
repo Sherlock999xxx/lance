@@ -520,9 +520,16 @@ impl Dataset {
                 .and_then(|v| v.extract::<bool>().ok())
                 .unwrap_or(false);
 
+            let serialized_scheduling = read_params_dict
+                .get_item("serialized_scheduling")
+                .unwrap_or(None)
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
             let decoder_config = DecoderConfig {
                 cache_repetition_index,
                 validate_on_decode,
+                serialized_scheduling,
             };
             let file_reader_options = FileReaderOptions {
                 decoder_config,

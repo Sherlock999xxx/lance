@@ -664,6 +664,7 @@ impl LanceFileReader {
             object_store,
             SchedulerConfig {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
+                use_lite_scheduler: false,
             },
         )
         .infer_error()?;
