@@ -661,28 +661,9 @@ impl BooleanMatchPlan {
             }
             FtsQuery::Boolean(bool_query) => {
                 let mut column = None;
-                let mut should = Vec::with_capacity(bool_query.should.len());
-                let mut must = Vec::with_capacity(bool_query.must.len());
-                let mut must_not = Vec::with_capacity(bool_query.must_not.len());
-
-                for query in &bool_query.should {
-                    let FtsQuery::Match(match_query) = query else {
-                        return None;
-                    };
-                    Self::push_match(&mut should, &mut column, match_query)?;
-                }
-                for query in &bool_query.must {
-                    let FtsQuery::Match(match_query) = query else {
-                        return None;
-                    };
-                    Self::push_match(&mut must, &mut column, match_query)?;
-                }
-                for query in &bool_query.must_not {
-                    let FtsQuery::Match(match_query) = query else {
-                        return None;
-                    };
-                    Self::push_match(&mut must_not, &mut column, match_query)?;
-                }
+                let should = Self::collect_matches(&bool_query.should, &mut column)?;
+                let must = Self::collect_matches(&bool_query.must, &mut column)?;
+                let must_not = Self::collect_matches(&bool_query.must_not, &mut column)?;
 
                 if should.is_empty() && must.is_empty() {
                     return None;
@@ -713,6 +694,20 @@ impl BooleanMatchPlan {
         }
         dest.push(query.clone());
         Some(())
+    }
+
+    fn collect_matches(
+        queries: &[FtsQuery],
+        column: &mut Option<String>,
+    ) -> Option<Vec<MatchQuery>> {
+        let mut matches = Vec::with_capacity(queries.len());
+        for query in queries {
+            let FtsQuery::Match(match_query) = query else {
+                return None;
+            };
+            Self::push_match(&mut matches, column, match_query)?;
+        }
+        Some(matches)
     }
 }
 
