@@ -14,6 +14,11 @@
 package org.lance;
 
 import org.lance.compaction.CompactionOptions;
+import org.lance.index.Index;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.OptimizeOptions;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
@@ -67,6 +72,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1122,6 +1128,70 @@ public class DatasetTest {
   }
 
   @Test
+  void testCommitTransactionDetachedTrue(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testCommitTransactionDetachedTrue").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset base = suite.createEmptyDataset(true)) {
+        assertEquals(1, base.version());
+        assertEquals(1, base.latestVersion());
+        assertEquals(0, base.countRows());
+        long baseVersion = base.version();
+        long baseLatestVersion = base.latestVersion();
+        long baseRowCount = base.countRows();
+        FragmentMetadata fragment = suite.createNewFragment(5);
+        Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
+        Transaction transaction = base.newTransactionBuilder().operation(append).build();
+        try (Dataset committed = base.commitTransaction(transaction, true)) {
+          // Original dataset is not refreshed to the new version.
+          assertEquals(baseVersion, base.version());
+          assertEquals(baseRowCount, base.countRows());
+
+          // Latest version should not change.
+          assertEquals(base.latestVersion(), baseLatestVersion);
+
+          // Committed dataset has a detached version.
+          assertNotEquals(baseVersion + 1, committed.version());
+          assertNotEquals(committed.version(), committed.latestVersion());
+          assertEquals(baseRowCount + 5, committed.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testCommitTransactionDetachedTrueOnV1ManifestThrowsUnsupported(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("commitTransactionDetachedTrueOnV1").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = suite.createEmptyDataset()) {
+        List<Version> versionsBefore = dataset.listVersions();
+        long versionIdBefore = versionsBefore.get(0).getId();
+
+        FragmentMetadata fragment = suite.createNewFragment(3);
+        Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
+        Transaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        UnsupportedOperationException ex =
+            assertThrows(
+                UnsupportedOperationException.class,
+                () -> dataset.commitTransaction(transaction, true));
+
+        // Error should indicate detached commits are not supported on v1 manifests.
+        assertNotNull(ex.getMessage());
+        assertTrue(ex.getMessage().toLowerCase().contains("detached"));
+
+        // Dataset state should remain unchanged after the failed detached commit.
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+        List<Version> versionsAfter = dataset.listVersions();
+        assertEquals(1, versionsAfter.size());
+        assertEquals(versionIdBefore, versionsAfter.get(0).getId());
+      }
+    }
+  }
+
+  @Test
   void testEnableStableRowIds(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("enable_stable_row_ids").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -1635,6 +1705,63 @@ public class DatasetTest {
               }
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testOptimizingIndices(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("optimize_scalar").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // version 1, empty dataset
+      try (Dataset ignored = testDataset.createEmptyDataset()) {
+        // write first fragment at version 1 -> dataset version 2
+        try (Dataset dsWithData = testDataset.write(1, 10)) {
+          ScalarIndexParams scalarParams =
+              ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+          IndexParams indexParams =
+              IndexParams.builder().setScalarIndexParams(scalarParams).build();
+
+          dsWithData.createIndex(
+              Collections.singletonList("id"),
+              IndexType.BTREE,
+              Optional.of("id_idx"),
+              indexParams,
+              true);
+
+          List<Index> beforeIndexes = dsWithData.getIndexes();
+          Index idIndexBefore =
+              beforeIndexes.stream()
+                  .filter(idx -> "id_idx".equals(idx.name()))
+                  .findFirst()
+                  .orElse(null);
+          assertNotNull(idIndexBefore);
+          List<Integer> beforeFragments = idIndexBefore.fragments().orElse(Collections.emptyList());
+          assertTrue(beforeFragments.contains(0));
+          assertEquals(1, beforeFragments.size());
+        }
+
+        // append new fragment using readVersion 2 -> dataset version 3
+        try (Dataset dsAppended = testDataset.write(2, 10)) {
+          OptimizeOptions options = OptimizeOptions.builder().numIndicesToMerge(0).build();
+          dsAppended.optimizeIndices(options);
+
+          List<Index> afterIndexes = dsAppended.getIndexes();
+          Index idIndexAfter =
+              afterIndexes.stream()
+                  .filter(idx -> "id_idx".equals(idx.name()))
+                  .findFirst()
+                  .orElse(null);
+          assertNotNull(idIndexAfter);
+          List<Integer> afterFragments = idIndexAfter.fragments().orElse(Collections.emptyList());
+
+          assertTrue(afterFragments.contains(0));
+          assertTrue(afterFragments.contains(1));
+          assertEquals(2, afterFragments.size());
         }
       }
     }

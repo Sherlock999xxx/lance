@@ -39,6 +39,7 @@ use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
@@ -283,10 +284,12 @@ impl BlockingDataset {
         &mut self,
         transaction: Transaction,
         store_params: ObjectStoreParams,
+        detached: bool,
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
                 .with_store_params(store_params)
+                .with_detached(detached)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -322,13 +325,14 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     _obj: JObject,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
+    max_rows_per_file: JObject,        // Optional<Integer>
+    max_rows_per_group: JObject,       // Optional<Integer>
+    max_bytes_per_file: JObject,       // Optional<Long>
+    mode: JObject,                     // Optional<String>
+    enable_stable_row_ids: JObject,    // Optional<Boolean>
+    data_storage_version: JObject,     // Optional<String>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
+    storage_options_obj: JObject,      // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
     initial_bases: JObject,
     target_bases: JObject,
@@ -345,6 +349,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             mode,
             enable_stable_row_ids,
             data_storage_version,
+            enable_v2_manifest_paths,
             storage_options_obj,
             s3_credentials_refresh_offset_seconds_obj,
             initial_bases,
@@ -358,13 +363,14 @@ fn inner_create_with_ffi_schema<'local>(
     env: &mut JNIEnv<'local>,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
+    max_rows_per_file: JObject,        // Optional<Integer>
+    max_rows_per_group: JObject,       // Optional<Integer>
+    max_bytes_per_file: JObject,       // Optional<Long>
+    mode: JObject,                     // Optional<String>
+    enable_stable_row_ids: JObject,    // Optional<Boolean>
+    data_storage_version: JObject,     // Optional<String>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
+    storage_options_obj: JObject,      // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
     initial_bases: JObject,
     target_bases: JObject,
@@ -383,6 +389,7 @@ fn inner_create_with_ffi_schema<'local>(
         mode,
         enable_stable_row_ids,
         data_storage_version,
+        enable_v2_manifest_paths,
         storage_options_obj,
         JObject::null(), // No provider for schema-only creation
         s3_credentials_refresh_offset_seconds_obj,
@@ -412,13 +419,14 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,     // Optional<Integer>
-    max_rows_per_group: JObject,    // Optional<Integer>
-    max_bytes_per_file: JObject,    // Optional<Long>
-    mode: JObject,                  // Optional<String>
-    enable_stable_row_ids: JObject, // Optional<Boolean>
-    data_storage_version: JObject,  // Optional<String>
-    storage_options_obj: JObject,   // Map<String, String>
+    max_rows_per_file: JObject,        // Optional<Integer>
+    max_rows_per_group: JObject,       // Optional<Integer>
+    max_bytes_per_file: JObject,       // Optional<Long>
+    mode: JObject,                     // Optional<String>
+    enable_stable_row_ids: JObject,    // Optional<Boolean>
+    data_storage_version: JObject,     // Optional<String>
+    enable_v2_manifest_paths: JObject, // Optional<Boolean>
+    storage_options_obj: JObject,      // Map<String, String>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
     initial_bases: JObject,
     target_bases: JObject,
@@ -434,6 +442,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            enable_v2_manifest_paths,
             data_storage_version,
             storage_options_obj,
             JObject::null(),
@@ -456,6 +465,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
     mode: JObject,                         // Optional<String>
     enable_stable_row_ids: JObject,        // Optional<Boolean>
     data_storage_version: JObject,         // Optional<String>
+    enable_v2_manifest_paths: JObject,     // Optional<Boolean>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
@@ -474,6 +484,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStreamAndProvider<'lo
             mode,
             enable_stable_row_ids,
             data_storage_version,
+            enable_v2_manifest_paths,
             storage_options_obj,
             storage_options_provider_obj,
             s3_credentials_refresh_offset_seconds_obj,
@@ -494,6 +505,7 @@ fn inner_create_with_ffi_stream<'local>(
     mode: JObject,                         // Optional<String>
     enable_stable_row_ids: JObject,        // Optional<Boolean>
     data_storage_version: JObject,         // Optional<String>
+    enable_v2_manifest_paths: JObject,     // Optional<Boolean>
     storage_options_obj: JObject,          // Map<String, String>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject, // Optional<Long>
@@ -511,6 +523,7 @@ fn inner_create_with_ffi_stream<'local>(
         mode,
         enable_stable_row_ids,
         data_storage_version,
+        enable_v2_manifest_paths,
         storage_options_obj,
         storage_options_provider_obj,
         s3_credentials_refresh_offset_seconds_obj,
@@ -530,6 +543,7 @@ fn create_dataset<'local>(
     mode: JObject,
     enable_stable_row_ids: JObject,
     data_storage_version: JObject,
+    enable_v2_manifest_paths: JObject,
     storage_options_obj: JObject,
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
     s3_credentials_refresh_offset_seconds_obj: JObject,
@@ -547,6 +561,7 @@ fn create_dataset<'local>(
         &mode,
         &enable_stable_row_ids,
         &data_storage_version,
+        Some(&enable_v2_manifest_paths),
         &storage_options_obj,
         &storage_options_provider_obj,
         &s3_credentials_refresh_offset_seconds_obj,
@@ -806,7 +821,8 @@ fn inner_create_index(
         | IndexType::Inverted
         | IndexType::NGram
         | IndexType::ZoneMap
-        | IndexType::BloomFilter => {
+        | IndexType::BloomFilter
+        | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
@@ -960,6 +976,54 @@ fn inner_merge_index_metadata(
             ))),
         }
     })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    options_obj: JObject, // OptimizeOptions
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_optimize_indices(&mut env, java_dataset, options_obj)
+    );
+}
+
+fn inner_optimize_indices(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_options: JObject, // OptimizeOptions
+) -> Result<()> {
+    let mut options = OptimizeOptions::default();
+
+    if !java_options.is_null() {
+        options.num_indices_to_merge =
+            env.get_optional_usize_from_method(&java_options, "getNumIndicesToMerge")?;
+
+        // getIndexNames(): Optional<List<String>>
+        let index_names_obj = env
+            .call_method(
+                &java_options,
+                "getIndexNames",
+                "()Ljava/util/Optional;",
+                &[],
+            )?
+            .l()?;
+        let index_names = env.get_strings_opt(&index_names_obj)?;
+        options.index_names = index_names;
+
+        // isRetrain(): boolean
+        let retrain = env
+            .call_method(&java_options, "isRetrain", "()Z", &[])?
+            .z()?;
+        options.retrain = retrain;
+    }
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.optimize_indices(&options))?;
+    Ok(())
 }
 
 //////////////////
@@ -1560,6 +1624,21 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     RT.block_on(dataset_guard.inner.delete(&predicate_str))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeTruncateTable(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_truncate_table(&mut env, java_dataset))
+}
+
+fn inner_truncate_table(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.truncate_table())?;
     Ok(())
 }
 
