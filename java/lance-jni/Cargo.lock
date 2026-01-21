@@ -4279,6 +4279,7 @@ dependencies = [
  "azure_identity",
  "azure_storage",
  "azure_storage_blobs",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "futures",
@@ -4294,6 +4295,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "time",
  "tokio",
@@ -4304,9 +4306,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.3.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00a21b43fe2a373896727b97927adedd2683d2907683f294f62cf8815fbf6a01"
+checksum = "a2acdba67f84190067532fce07b51a435dd390d7cdc1129a05003e5cb3274cf0"
 dependencies = [
  "reqwest",
  "serde",
