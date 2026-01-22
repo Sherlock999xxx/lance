@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-/// Bits per value for FixedWidth dictionary values (currently only 128-bit is supported)
+/// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
 /// Bits per index for dictionary indices (always i32)
 pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
@@ -182,7 +182,7 @@ where
 
 /// Dictionary encodes a data block
 ///
-/// Currently only supported for some common cases (string / binary / u128)
+/// Currently only supported for some common cases (string / binary / 64-bit / 128-bit)
 ///
 /// Returns a block of indices (will always be a fixed width data block) and a block of dictionary
 pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBlock)> {
@@ -194,56 +194,108 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
     let data_block_size = data_block.data_size() as usize;
     match data_block {
         DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
-            // Currently FixedWidth DataBlock with only bits_per_value 128 has cardinality
-            // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
-            let mut map = HashMap::new();
-            let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
-            let u128_slice = u128_slice.as_ref();
-            let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
-            let mut indices_buffer = Vec::with_capacity(fixed_width_data_block.num_values as usize);
-            let mut curr_idx: i32 = 0;
+            let bytes_per_value = match fixed_width_data_block.bits_per_value {
+                64 => 8usize,
+                128 => 16usize,
+                _ => return None,
+            };
 
-            for &value in u128_slice.iter() {
-                let idx = *map.entry(value).or_insert_with(|| {
-                    dictionary_buffer.push(value);
-                    curr_idx += 1;
-                    curr_idx - 1
-                });
-                indices_buffer.push(idx);
-                if (dictionary_buffer.len() * 128 / 8
-                    + indices_buffer.len() * DICT_INDICES_BITS_PER_VALUE as usize / 8)
-                    > data_block_size
-                {
-                    return None;
+            match fixed_width_data_block.bits_per_value {
+                64 => {
+                    let mut map = HashMap::new();
+                    let u64_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u64>();
+                    let u64_slice = u64_slice.as_ref();
+                    let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
+                    let mut indices_buffer =
+                        Vec::with_capacity(fixed_width_data_block.num_values as usize);
+                    let mut curr_idx: i32 = 0;
+
+                    for &value in u64_slice.iter() {
+                        let idx = *map.entry(value).or_insert_with(|| {
+                            dictionary_buffer.push(value);
+                            curr_idx += 1;
+                            curr_idx - 1
+                        });
+                        indices_buffer.push(idx);
+                        if dictionary_buffer.len() * bytes_per_value
+                            + indices_buffer.len() * (DICT_INDICES_BITS_PER_VALUE as usize / 8)
+                            > data_block_size
+                        {
+                            return None;
+                        }
+                    }
+
+                    let mut dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+                        bits_per_value: 64,
+                        num_values: curr_idx as u64,
+                        block_info: BlockInfo::default(),
+                    });
+                    dictionary_data_block.compute_stat();
+                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                        data: LanceBuffer::reinterpret_vec(indices_buffer),
+                        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
+                        num_values: fixed_width_data_block.num_values,
+                        block_info: BlockInfo::default(),
+                    });
+                    indices_data_block.compute_stat();
+
+                    Some((indices_data_block, dictionary_data_block))
                 }
-            }
-            let dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                bits_per_value: DICT_FIXED_WIDTH_BITS_PER_VALUE,
-                num_values: curr_idx as u64,
-                block_info: BlockInfo::default(),
-            });
-            let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                data: LanceBuffer::reinterpret_vec(indices_buffer),
-                bits_per_value: DICT_INDICES_BITS_PER_VALUE,
-                num_values: fixed_width_data_block.num_values,
-                block_info: BlockInfo::default(),
-            });
-            // Todo: if we decide to do eager statistics computing, wrap statistics computing
-            // in DataBlock constructor.
-            indices_data_block.compute_stat();
+                128 => {
+                    // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
+                    let mut map = HashMap::new();
+                    let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
+                    let u128_slice = u128_slice.as_ref();
+                    let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
+                    let mut indices_buffer =
+                        Vec::with_capacity(fixed_width_data_block.num_values as usize);
+                    let mut curr_idx: i32 = 0;
 
-            Some((indices_data_block, dictionary_data_block))
+                    for &value in u128_slice.iter() {
+                        let idx = *map.entry(value).or_insert_with(|| {
+                            dictionary_buffer.push(value);
+                            curr_idx += 1;
+                            curr_idx - 1
+                        });
+                        indices_buffer.push(idx);
+                        if dictionary_buffer.len() * bytes_per_value
+                            + indices_buffer.len() * (DICT_INDICES_BITS_PER_VALUE as usize / 8)
+                            > data_block_size
+                        {
+                            return None;
+                        }
+                    }
+
+                    let mut dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+                        bits_per_value: DICT_FIXED_WIDTH_BITS_PER_VALUE,
+                        num_values: curr_idx as u64,
+                        block_info: BlockInfo::default(),
+                    });
+                    dictionary_data_block.compute_stat();
+                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                        data: LanceBuffer::reinterpret_vec(indices_buffer),
+                        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
+                        num_values: fixed_width_data_block.num_values,
+                        block_info: BlockInfo::default(),
+                    });
+                    indices_data_block.compute_stat();
+
+                    Some((indices_data_block, dictionary_data_block))
+                }
+                _ => None,
+            }
         }
         DataBlock::VariableWidth(ref variable_width_data_block) => {
             match variable_width_data_block.bits_per_offset {
                 32 => dict_encode_variable_width::<u32>(variable_width_data_block, 32, cardinality),
                 64 => dict_encode_variable_width::<u64>(variable_width_data_block, 64, cardinality),
-                _ => unreachable!("Variable width offsets can only be 32 or 64 bits"),
+                _ => None,
             }
         }
         _ => {
-            unreachable!("dictionary encode called with data block {:?}", data_block)
+            None
         }
     }
 }
