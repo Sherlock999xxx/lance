@@ -157,7 +157,7 @@ def test_analyze_fts_arrow(tmp_path: Path) -> None:
     _write_lance(tmp_path / "part_1_docs.lance", docs1)
 
     stats = analyze_fts(
-        tmp_path,
+        str(tmp_path),
         compare=(0, 1),
         include_term_lengths=True,
         compute_union=True,
@@ -165,6 +165,7 @@ def test_analyze_fts_arrow(tmp_path: Path) -> None:
 
     assert stats["partition_count"] == 2
     assert stats["unique_terms"] == 3
+    assert stats["bytes_summary"]["count"] == 2
 
     compare = stats["compare"]
     assert compare["common_terms"] == 1

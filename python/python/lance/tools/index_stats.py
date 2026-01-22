@@ -8,12 +8,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import struct
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from lance.file import LanceFileReader
+from lance.file import LanceFileReader, LanceFileSession
 
 TRANS_INDEX_THRESHOLD = 32
 EMPTY_ADDRESS = 0
@@ -641,31 +643,27 @@ def iter_fst_map_items(data: bytes) -> Iterator[Tuple[bytes, int]]:
             stack.append((next_addr, prefix + bytes([inp]), acc + out))
 
 
-def _load_lance_metadata(path: Path) -> Dict[str, str]:
-    reader = LanceFileReader(str(path))
+def _load_lance_metadata(reader: LanceFileReader) -> Dict[str, str]:
     metadata = reader.metadata().schema.metadata
     return _normalize_metadata(metadata)
 
 
-def _load_lengths(path: Path) -> List[int]:
-    reader = LanceFileReader(str(path))
+def _load_lengths(reader: LanceFileReader) -> List[int]:
     num_rows = reader.metadata().num_rows
     table = reader.read_all(batch_size=num_rows).to_table()
     if "_length" not in table.column_names:
-        raise ValueError(f"Missing _length column in {path}")
+        raise ValueError("Missing _length column in invert file")
     return [int(x) for x in table.column("_length").to_pylist()]
 
-
-def _detect_token_format(path: Path, fallback: Optional[str]) -> str:
+def _detect_token_format(reader: LanceFileReader, fallback: Optional[str]) -> str:
     if fallback:
         return fallback
-    reader = LanceFileReader(str(path))
     schema = reader.metadata().schema
     if any(field.name == "_token" for field in schema):
         return "arrow"
     if any(field.name == "_token_fst_bytes" for field in schema):
         return "fst"
-    raise ValueError(f"Unable to detect token format for {path}")
+    raise ValueError("Unable to detect token format for tokens file")
 
 
 @dataclass
@@ -677,12 +675,11 @@ class _TokenData:
 
 
 def _load_tokens(
-    path: Path,
+    reader: LanceFileReader,
     token_format: str,
     need_id_map: bool,
     need_set: bool,
 ) -> _TokenData:
-    reader = LanceFileReader(str(path))
     num_rows = reader.metadata().num_rows
     if token_format == "arrow":
         if not need_id_map and not need_set:
@@ -755,12 +752,82 @@ class VectorStats:
     lengths_summary: Dict[str, Optional[float]]
 
 
-def analyze_vector(index_path: Path) -> VectorStats:
-    if index_path.is_dir():
-        index_path = index_path / "index.idx"
-    if not index_path.exists():
-        raise FileNotFoundError(f"Index file not found: {index_path}")
-    reader = LanceFileReader(str(index_path))
+def _is_object_uri(path: str) -> bool:
+    parsed = urlparse(path)
+    return bool(parsed.scheme and parsed.scheme != "file")
+
+
+def _file_size(reader: LanceFileReader) -> int:
+    stats = reader.file_statistics()
+    return int(sum(column.size_bytes for column in stats.columns))
+
+
+def _make_session(base_path: Union[str, Path]) -> LanceFileSession:
+    return LanceFileSession(str(base_path))
+
+
+def _partition_file_paths(partition_id: Optional[int], partitioned: bool) -> Dict[str, str]:
+    if partitioned:
+        if partition_id is None:
+            raise ValueError("Partition id is required for partitioned index")
+        prefix = f"part_{partition_id}_"
+    else:
+        prefix = ""
+    return {
+        "tokens": f"{prefix}tokens.lance",
+        "invert": f"{prefix}invert.lance",
+        "docs": f"{prefix}docs.lance",
+    }
+
+
+def _discover_partitions(session: LanceFileSession) -> Tuple[List[int], Optional[str], bool]:
+    token_format = None
+    partitions: Optional[List[int]] = None
+
+    if session.contains("metadata.lance"):
+        metadata_reader = session.open_reader("metadata.lance")
+        metadata = _load_lance_metadata(metadata_reader)
+        if "token_set_format" in metadata:
+            token_format = metadata["token_set_format"].lower()
+        if "partitions" in metadata:
+            partitions = json.loads(metadata["partitions"])
+
+    files = session.list()
+    part_tokens = [
+        path
+        for path in files
+        if path.endswith("_tokens.lance") and Path(path).name.startswith("part_")
+    ]
+    partitioned = bool(part_tokens)
+
+    if partitions is None:
+        if part_tokens:
+            ids: List[int] = []
+            for path in part_tokens:
+                name = Path(path).name
+                match = re.match(r"part_(\\d+)_tokens\\.lance$", name)
+                if not match:
+                    raise ValueError(f"Unexpected partition file name: {name}")
+                ids.append(int(match.group(1)))
+            partitions = ids
+        elif "tokens.lance" in files:
+            partitions = [0]
+        else:
+            raise FileNotFoundError("No tokens.lance or partitioned token files found")
+
+    return partitions, token_format, partitioned
+
+
+def analyze_vector(index_path: Union[str, Path]) -> VectorStats:
+    index_path_str = str(index_path)
+    if not index_path_str.endswith("index.idx"):
+        if _is_object_uri(index_path_str):
+            index_path_str = index_path_str.rstrip("/") + "/index.idx"
+        else:
+            local_path = Path(index_path_str)
+            if local_path.is_dir():
+                index_path_str = str(local_path / "index.idx")
+    reader = LanceFileReader(index_path_str)
     metadata = _normalize_metadata(reader.metadata().schema.metadata)
     if "lance:ivf" not in metadata:
         raise ValueError("Missing lance:ivf metadata in index file")
@@ -775,63 +842,14 @@ def analyze_vector(index_path: Path) -> VectorStats:
     )
 
 
-def _partition_file_paths(index_dir: Path, partition_id: Optional[int]) -> Dict[str, Path]:
-    if partition_id is None:
-        return {
-            "tokens": index_dir / "tokens.lance",
-            "invert": index_dir / "invert.lance",
-            "docs": index_dir / "docs.lance",
-        }
-    prefix = f"part_{partition_id}_"
-    return {
-        "tokens": index_dir / f"{prefix}tokens.lance",
-        "invert": index_dir / f"{prefix}invert.lance",
-        "docs": index_dir / f"{prefix}docs.lance",
-    }
-
-
-def _discover_partitions(index_dir: Path) -> Tuple[List[int], Optional[str], bool]:
-    metadata_path = index_dir / "metadata.lance"
-    token_format = None
-    partitions: Optional[List[int]] = None
-    if metadata_path.exists():
-        metadata = _load_lance_metadata(metadata_path)
-        if "token_set_format" in metadata:
-            token_format = metadata["token_set_format"].lower()
-        if "partitions" in metadata:
-            partitions = json.loads(metadata["partitions"])
-
-    part_tokens = sorted(index_dir.glob("part_*_tokens.lance"))
-    partitioned = bool(part_tokens)
-
-    if partitions is None:
-        if part_tokens:
-            ids: List[int] = []
-            for path in part_tokens:
-                name = path.name
-                try:
-                    part_id = int(name.split("_")[1])
-                except (IndexError, ValueError) as exc:
-                    raise ValueError(f"Unexpected partition file name: {name}") from exc
-                ids.append(part_id)
-            partitions = ids
-        elif (index_dir / "tokens.lance").exists():
-            partitions = [0]
-        else:
-            raise FileNotFoundError(
-                f"No tokens.lance or partitioned token files in {index_dir}"
-            )
-
-    return partitions, token_format, partitioned
-
-
 def analyze_fts(
-    index_dir: Path,
+    index_dir: Union[str, Path],
     compare: Optional[Tuple[int, int]] = None,
     include_term_lengths: bool = False,
     compute_union: bool = True,
 ) -> Dict[str, object]:
-    partitions, token_format, partitioned = _discover_partitions(index_dir)
+    session = _make_session(index_dir)
+    partitions, token_format, partitioned = _discover_partitions(session)
     stats: List[PartitionStats] = []
     sizes: List[int] = []
     bytes_totals: List[int] = []
@@ -840,22 +858,24 @@ def analyze_fts(
     compare_ids = set(compare) if compare else set()
 
     for part_id in partitions:
-        file_paths = _partition_file_paths(index_dir, part_id if partitioned else None)
-        docs_reader = LanceFileReader(str(file_paths["docs"]))
+        file_paths = _partition_file_paths(part_id if partitioned else None, partitioned)
+        docs_reader = session.open_reader(file_paths["docs"])
         docs_count = int(docs_reader.metadata().num_rows)
-        lengths = _load_lengths(file_paths["invert"])
+        invert_reader = session.open_reader(file_paths["invert"])
+        lengths = _load_lengths(invert_reader)
         sizes.append(docs_count)
         need_id_map = include_term_lengths
         need_set = compute_union or (compare is not None and part_id in compare_ids)
-        detected_format = _detect_token_format(file_paths["tokens"], token_format)
-        tokens = _load_tokens(file_paths["tokens"], detected_format, need_id_map, need_set)
+        tokens_reader = session.open_reader(file_paths["tokens"])
+        detected_format = _detect_token_format(tokens_reader, token_format)
+        tokens = _load_tokens(tokens_reader, detected_format, need_id_map, need_set)
         if all_terms is not None and tokens.tokens is not None:
             all_terms.update(tokens.tokens)
 
         bytes_breakdown = {
-            "tokens": file_paths["tokens"].stat().st_size,
-            "invert": file_paths["invert"].stat().st_size,
-            "docs": file_paths["docs"].stat().st_size,
+            "tokens": _file_size(tokens_reader),
+            "invert": _file_size(invert_reader),
+            "docs": _file_size(docs_reader),
         }
         bytes_total = sum(bytes_breakdown.values())
         bytes_totals.append(bytes_total)
