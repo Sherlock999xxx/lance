@@ -7,7 +7,12 @@ from pathlib import Path
 import pyarrow as pa
 
 from lance.file import LanceFileWriter
-from lance.tools.index_stats import analyze_fts, iter_fst_map_items, parse_ivf_proto
+from lance.tools.index_stats import (
+    _parse_args_from_list,
+    analyze_fts,
+    iter_fst_map_items,
+    parse_ivf_proto,
+)
 
 
 def _encode_varint(value: int) -> bytes:
@@ -181,3 +186,9 @@ def test_analyze_fts_arrow(tmp_path: Path) -> None:
     assert part0["term_lengths"]["banana"] == 5
     assert part1["term_lengths"]["banana"] == 2
     assert part1["term_lengths"]["date"] == 7
+
+
+def test_parse_args_preserves_object_uri() -> None:
+    uri = "gs://bucket/path/index_dir"
+    args = _parse_args_from_list(["fts", uri])
+    assert args.path == uri

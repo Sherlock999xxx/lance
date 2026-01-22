@@ -987,17 +987,25 @@ def _fts_text_report(stats: Dict[str, object], verbose: bool) -> str:
     return "\n".join(lines)
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args_from_list(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inspect Lance index files")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     vector_parser = subparsers.add_parser("vector", help="Analyze vector index")
-    vector_parser.add_argument("path", type=Path, help="Path to index.idx or its directory")
+    vector_parser.add_argument(
+        "path",
+        type=str,
+        help="Path to index.idx or its directory (supports object storage URIs)",
+    )
     vector_parser.add_argument("--format", choices=["text", "json"], default="text")
     vector_parser.add_argument("--verbose", action="store_true")
 
     fts_parser = subparsers.add_parser("fts", help="Analyze FTS index")
-    fts_parser.add_argument("path", type=Path, help="Path to FTS index directory")
+    fts_parser.add_argument(
+        "path",
+        type=str,
+        help="Path to FTS index directory (supports object storage URIs)",
+    )
     fts_parser.add_argument("--format", choices=["text", "json"], default="text")
     fts_parser.add_argument("--verbose", action="store_true")
     fts_parser.add_argument(
@@ -1017,7 +1025,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip computing union of terms across partitions",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def _parse_args() -> argparse.Namespace:
+    return _parse_args_from_list()
 
 
 def main() -> None:
