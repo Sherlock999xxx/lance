@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, FixedSizeListArray};
+use arrow_array::{cast::AsArray, Array, ArrayRef, FixedSizeListArray, RecordBatch};
 use futures::StreamExt;
 use lance_arrow::{interleave_batches, DataTypeExt};
 use lance_core::datatypes::Schema;
-use log::info;
+use lance_linalg::distance::DistanceType;
+use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::SeedableRng;
@@ -16,6 +17,124 @@ use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
+
+/// Helper function to extract a column from a RecordBatch, supporting nested field paths.
+///
+/// This function handles:
+/// - Simple column names: "column"
+/// - Nested paths: "parent.child" or "parent.child.grandchild"
+/// - Backtick-escaped field names: "parent.`field.with.dots`"
+fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+    // Try to get the column directly first (fast path for simple columns)
+    if let Some(col) = batch.column_by_name(column) {
+        return Ok(col.clone());
+    }
+
+    // Parse the field path using Lance's field path parsing logic
+    // This properly handles backtick-escaped field names
+    let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| Error::Index {
+        message: format!("Failed to parse field path '{}': {}", column, e),
+        location: location!(),
+    })?;
+
+    if parts.is_empty() {
+        return Err(Error::Index {
+            message: format!("Invalid empty field path: {}", column),
+            location: location!(),
+        });
+    }
+
+    // Get the root column
+    let mut current_array: ArrayRef = batch
+        .column_by_name(&parts[0])
+        .ok_or_else(|| Error::Index {
+            message: format!(
+                "Column '{}' does not exist in batch (looking for root field '{}')",
+                column, parts[0]
+            ),
+            location: location!(),
+        })?
+        .clone();
+
+    // Navigate through nested struct fields
+    for part in &parts[1..] {
+        let struct_array = current_array
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .ok_or_else(|| Error::Index {
+                message: format!(
+                    "Cannot access nested field '{}' in column '{}': parent is not a struct",
+                    part, column
+                ),
+                location: location!(),
+            })?;
+
+        current_array = struct_array
+            .column_by_name(part)
+            .ok_or_else(|| Error::Index {
+                message: format!(
+                    "Nested field '{}' does not exist in column '{}'",
+                    part, column
+                ),
+                location: location!(),
+            })?
+            .clone();
+    }
+
+    Ok(current_array)
+}
+
+async fn estimate_multivector_vectors_per_row(
+    dataset: &Dataset,
+    column: &str,
+    num_rows: usize,
+) -> Result<usize> {
+    if num_rows == 0 {
+        return Ok(1030);
+    }
+
+    let projection = dataset.schema().project(&[column])?;
+
+    // Try a few random samples first (fast path).
+    let sample_batch_size = std::cmp::min(64, num_rows);
+    for _ in 0..8 {
+        let batch = dataset.sample(sample_batch_size, &projection).await?;
+        let array = get_column_from_batch(&batch, column)?;
+        let list_array = array.as_list::<i32>();
+        for i in 0..list_array.len() {
+            if list_array.is_null(i) {
+                continue;
+            }
+            let len = list_array.value_length(i) as usize;
+            if len > 0 {
+                return Ok(len);
+            }
+        }
+    }
+
+    // Fallback: scan a small prefix to find a non-null example. This avoids rare
+    // flakiness when values are extremely sparse.
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+    scanner.filter_expr(column_expr.is_not_null());
+    scanner.limit(Some(std::cmp::min(num_rows, 1024) as i64), None)?;
+    let batch = scanner.try_into_batch().await?;
+    let array = get_column_from_batch(&batch, column)?;
+    let list_array = array.as_list::<i32>();
+    for i in 0..list_array.len() {
+        let len = list_array.value_length(i) as usize;
+        if len > 0 {
+            return Ok(len);
+        }
+    }
+
+    warn!(
+        "Could not find a non-empty multivector value for column {}, falling back to n=1030",
+        column
+    );
+    Ok(1030)
+}
 
 /// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
@@ -54,6 +173,46 @@ pub fn get_vector_type(
         field.data_type(),
         infer_vector_element_type(&field.data_type())?,
     ))
+}
+
+/// Returns the default distance type for the given vector element type.
+pub fn default_distance_type_for(element_type: &arrow_schema::DataType) -> DistanceType {
+    match element_type {
+        arrow_schema::DataType::UInt8 => DistanceType::Hamming,
+        _ => DistanceType::L2,
+    }
+}
+
+/// Validate that the distance type is supported by the vector element type.
+pub fn validate_distance_type_for(
+    distance_type: DistanceType,
+    element_type: &arrow_schema::DataType,
+) -> Result<()> {
+    let supported = match element_type {
+        arrow_schema::DataType::UInt8 => matches!(distance_type, DistanceType::Hamming),
+        arrow_schema::DataType::Int8
+        | arrow_schema::DataType::Float16
+        | arrow_schema::DataType::Float32
+        | arrow_schema::DataType::Float64 => {
+            matches!(
+                distance_type,
+                DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
+            )
+        }
+        _ => false,
+    };
+
+    if supported {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            format!(
+                "Distance type {} does not support {} vectors",
+                distance_type, element_type
+            ),
+            location!(),
+        ))
+    }
 }
 
 /// If the data type is a fixed size list or list of fixed size list return the inner element type
@@ -124,11 +283,12 @@ pub async fn maybe_sample_training_data(
         arrow::datatypes::DataType::List(_) => {
             // for multivector, we need `sample_size_hint` vectors for training,
             // but each multivector is a list of vectors, but we don't know how many
-            // vectors are in each multivector. For now we just assume there are 1030 vectors
-            // in each multivector (Copali case).
+            // vectors are in each multivector. Estimate this by looking at a non-null row.
             // Set a minimum sample size of 128 to avoid too small samples,
             // it's not a problem because 128 multivectors is just about 64 MiB
-            sample_size_hint.div_ceil(1030).max(128)
+            let vectors_per_row =
+                estimate_multivector_vectors_per_row(dataset, column, num_rows).await?;
+            sample_size_hint.div_ceil(vectors_per_row).max(128)
         }
         _ => sample_size_hint,
     };
@@ -168,13 +328,7 @@ pub async fn maybe_sample_training_data(
         while let Some(batch) = scan.next().await {
             let batch = batch?;
 
-            let array = batch.column_by_name(column).ok_or(Error::Index {
-                message: format!(
-                    "Sample training data: column {} does not exist in return",
-                    column
-                ),
-                location: location!(),
-            })?;
+            let array = get_column_from_batch(&batch, column)?;
             let null_count = array.logical_null_count();
             if null_count < array.len() {
                 num_non_null += array.len() - null_count;
@@ -215,7 +369,8 @@ pub async fn maybe_sample_training_data(
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
         if is_nullable {
-            scanner.filter_expr(datafusion_expr::col(column).is_not_null());
+            let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+            scanner.filter_expr(column_expr.is_not_null());
         }
         let batch = scanner.try_into_batch().await?;
         info!(
@@ -225,13 +380,7 @@ pub async fn maybe_sample_training_data(
         batch
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
+    let array = get_column_from_batch(&batch, column)?;
 
     match array.data_type() {
         arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
@@ -343,6 +492,11 @@ fn random_ranges(
 mod tests {
     use super::*;
 
+    use arrow_array::types::Float32Type;
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
+
+    use crate::dataset::InsertBuilder;
+
     #[rstest::rstest]
     #[test]
     fn test_random_ranges(
@@ -364,5 +518,61 @@ mod tests {
             start..end
         });
         assert_eq!(ranges, expected.collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_sample_training_data_multivector_infers_vectors_per_row() {
+        let nrows: usize = 2000;
+        let dims: u32 = 8;
+        let vectors_per_row: u32 = 2;
+
+        let mv = array::cycle_vec_var(
+            array::rand_vec::<Float32Type>(Dimension::from(dims)),
+            Dimension::from(vectors_per_row),
+            Dimension::from(vectors_per_row + 1),
+        );
+
+        let data = gen_batch()
+            .col("mv", mv)
+            .into_batch_rows(RowCount::from(nrows as u64))
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let training_data = maybe_sample_training_data(&dataset, "mv", 1000)
+            .await
+            .unwrap();
+        assert_eq!(training_data.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_multivector_vectors_per_row_fallback_1030() {
+        let nrows: usize = 256;
+        let dims: u32 = 8;
+
+        let mv = array::cycle_vec_var(
+            array::rand_vec::<Float32Type>(Dimension::from(dims)),
+            Dimension::from(2),
+            Dimension::from(3),
+        )
+        .with_random_nulls(1.0);
+
+        let data = gen_batch()
+            .col("mv", mv)
+            .into_batch_rows(RowCount::from(nrows as u64))
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows)
+            .await
+            .unwrap();
+        assert_eq!(n, 1030);
     }
 }
