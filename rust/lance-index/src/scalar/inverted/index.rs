@@ -106,7 +106,7 @@ const POSTING_LIST_EST_BYTES_PER_ENTRY: u64 = 8;
 #[cfg(test)]
 const SEGMENT_SIZE_BYTES: u64 = 64;
 #[cfg(not(test))]
-const SEGMENT_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+const SEGMENT_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
