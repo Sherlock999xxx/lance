@@ -122,7 +122,6 @@ where
     usize: TryFrom<T>,
 {
     use std::collections::hash_map::Entry;
-
     let mut map = HashMap::new();
     let offsets = variable_width_data_block
         .offsets

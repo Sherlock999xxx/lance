@@ -4277,8 +4277,8 @@ impl PrimitiveStructuralEncoder {
     /// 1. Dictionary: stores unique values
     /// 2. Indices: maps each value to a dictionary entry
     ///
-    /// For FixedWidth (e.g., 128-bit Decimal):
-    /// - Dictionary: cardinality × 16 bytes (128 bits per value)
+    /// For FixedWidth:
+    /// - Dictionary values: cardinality × (bits_per_value / 8)
     /// - Indices: num_values × 4 bytes (32-bit i32)
     ///
     /// For VariableWidth (strings/binary):
@@ -4292,6 +4292,9 @@ impl PrimitiveStructuralEncoder {
         };
 
         let num_values = data_block.num_values();
+        if num_values == 0 {
+            return None;
+        }
         match data_block {
             DataBlock::FixedWidth(fixed) => {
                 if fixed.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
@@ -4319,20 +4322,20 @@ impl PrimitiveStructuralEncoder {
                 if var.bits_per_offset != 32 && var.bits_per_offset != 64 {
                     return None;
                 }
-                // The current variable-width dictionary encoding uses i32 indices.
                 if cardinality > i32::MAX as u64 {
                     return None;
                 }
 
-                let data_size = data_block.data_size();
-                let avg_value_size = data_size / num_values;
+                let bytes_per_offset = var.bits_per_offset as u64 / 8;
+                let avg_value_size = (var.data.len() as u64) / num_values;
 
-                // Dictionary values (including offsets, approximated): cardinality × avg_value_size
-                let dict_values_size = cardinality * avg_value_size;
-                // Indices: map each row to dictionary entry (i32)
-                let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
+                let dict_values_size = cardinality.checked_mul(avg_value_size)?;
+                let dict_offsets_size = (cardinality + 1).checked_mul(bytes_per_offset)?;
+                let indices_size = num_values.checked_mul(DICT_INDICES_BITS_PER_VALUE / 8)?;
 
-                Some(dict_values_size + indices_size)
+                dict_values_size
+                    .checked_add(dict_offsets_size)?
+                    .checked_add(indices_size)
             }
             _ => None,
         }
