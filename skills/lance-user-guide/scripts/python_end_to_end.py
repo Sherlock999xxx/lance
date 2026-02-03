@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument("--build-vector-index", action="store_true")
 
     parser.add_argument("--vector-index-type", default="IVF_PQ")
-    parser.add_argument("--num-partitions", type=int, default=64)
+    parser.add_argument("--target-partition-size", type=int, default=8192)
     parser.add_argument("--num-sub-vectors", type=int, default=8)
 
     parser.add_argument("--k", type=int, default=10)
@@ -52,7 +52,7 @@ def main() -> None:
         ds = ds.create_index(
             "vector",
             index_type=args.vector_index_type,
-            num_partitions=args.num_partitions,
+            target_partition_size=args.target_partition_size,
             num_sub_vectors=args.num_sub_vectors,
         )
 

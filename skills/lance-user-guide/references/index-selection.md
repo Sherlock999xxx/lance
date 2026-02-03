@@ -38,7 +38,7 @@ If you are unsure which types are supported in the user's environment, recommend
 Start with:
 
 - `index_type="IVF_PQ"`
-- `num_partitions`: 64 to 1024 (higher for larger datasets)
+- `target_partition_size`: start with 8192 and adjust based on the dataset size and latency/recall needs
 - `num_sub_vectors`: choose a value that divides the vector dimension
 
 Practical warning (performance):

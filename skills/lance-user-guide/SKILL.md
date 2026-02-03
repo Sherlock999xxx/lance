@@ -161,7 +161,7 @@ ds = lance.dataset("my-data.lance")
 ds = ds.create_index(
     "vector",
     index_type="IVF_PQ",
-    num_partitions=256,
+    target_partition_size=8192,
     num_sub_vectors=16,
 )
 ```
