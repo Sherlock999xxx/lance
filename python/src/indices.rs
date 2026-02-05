@@ -141,6 +141,7 @@ async fn do_train_ivf_model(
         dimension,
         distance_type,
         &params,
+        None,
     )
     .await
     .infer_error()?;
