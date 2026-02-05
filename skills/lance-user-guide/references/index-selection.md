@@ -17,7 +17,7 @@ Always confirm:
 | Vector search only (`nearest=...`) on large data | Build a vector index | Start with `IVF_PQ` if you need compression; tune `nprobes` / `refine_factor` |
 | Vector search + selective filter | Scalar index for filter + vector index for search | Use `prefilter=True` when you need true top-k among filtered rows |
 | Vector search + non-selective filter | Vector index only (or scalar index optional) | Consider `prefilter=False` for speed; accept fewer than k results |
-| Text search | Create a text-oriented scalar index | Use `full_text_query=...` when available; verify the supported index type in the current Lance version |
+| Text search | Create an `INVERTED` scalar index | Use `full_text_query=...` when available; note that `FTS` is not a universal alias in all SDK versions |
 
 ## Vector index types (user-facing summary)
 
@@ -63,7 +63,26 @@ Choose scalar index type based on the filter expression:
 
 - Equality filters on high-cardinality columns: start with `BTREE`
 - Equality / IN-list filters on low-cardinality columns: start with `BITMAP`
-- Text search: start with `FTS` (or other text index types supported by the version)
+- List membership filters on list-like columns: start with `LABEL_LIST`
+- Substring / `contains(...)` filters on strings: start with `NGRAM`
+- Text search: start with `INVERTED`
 - Range filters: start with range-friendly options (for example `ZONEMAP` when appropriate)
+- Highly selective negative membership / presence checks: consider `BLOOMFILTER` (inexact)
+- Geospatial queries (if present in your build): use `RTREE`
+
+## JSON fields
+
+Lance scalar indices are created on physical columns. If you want to index a JSON sub-field:
+
+1. Materialize the extracted value into a new column (for example with `add_columns`)
+2. Create a scalar index on that new column
+
+Example (Python, using SQL expressions):
+
+```python
+ds = lance.dataset(uri)
+ds.add_columns({"country": "json_extract(payload, '$.country')"})
+ds.create_scalar_index("country", "BTREE", replace=True)
+```
 
 If you cannot confidently map the filter to an index type, recommend `BTREE` as a safe baseline and confirm via a small benchmark on representative queries.

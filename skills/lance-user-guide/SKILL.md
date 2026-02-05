@@ -1,6 +1,6 @@
 ---
 name: lance-user-guide
-description: Guide Code Agents to help Lance users write/read datasets and build/choose indices. Use when a user asks how to use Lance (Python/Rust/CLI), how to write_dataset/open/scan, how to build vector indexes (IVF_PQ, IVF_HNSW_*), how to build scalar indexes (BTREE, BITMAP, INVERTED, FTS, etc.), how to combine filters with vector search, or how to debug indexing and scan performance.
+description: Guide Code Agents to help Lance users write/read datasets and build/choose indices. Use when a user asks how to use Lance (Python/Rust/CLI), how to write_dataset/open/scan, how to build vector indexes (IVF_PQ, IVF_HNSW_*), how to build scalar indexes (BTREE, BITMAP, LABEL_LIST, NGRAM, INVERTED, BLOOMFILTER, RTREE, etc.), how to combine filters with vector search, or how to debug indexing and scan performance.
 ---
 
 # Lance User Guide
@@ -187,7 +187,7 @@ Then verify:
 - `ds.describe_indices()`
 - A representative `scanner(filter=...)` query
 
-To choose a scalar index type (BTREE vs BITMAP vs INVERTED/FTS/NGRAM, etc.), consult `references/index-selection.md`.
+To choose a scalar index type (BTREE vs BITMAP vs LABEL_LIST vs NGRAM vs INVERTED, etc.), consult `references/index-selection.md`.
 
 ## Troubleshooting patterns
 
