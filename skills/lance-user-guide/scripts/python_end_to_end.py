@@ -37,11 +37,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.num_sub_vectors <= 0:
-        raise ValueError("--num-sub-vectors must be positive")
-    if args.dim % args.num_sub_vectors != 0:
-        raise ValueError("--dim must be divisible by --num-sub-vectors")
-
     uri = str(Path(args.uri))
     vec_arr, vec_np = _build_fixed_size_vectors(args.rows, args.dim)
     categories = pa.array(["a" if i % 2 == 0 else "b" for i in range(args.rows)])

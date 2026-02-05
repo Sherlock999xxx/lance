@@ -173,10 +173,6 @@ Then verify:
 
 For parameter selection and tuning, consult `references/index-selection.md`.
 
-Compatibility note:
-
-- `target_partition_size` is preferred for new code. If your installed Lance Python SDK does not support it, fall back to `num_partitions` (deprecated).
-
 ### Build a scalar index
 
 Scalar indices speed up scans with filters. Use `create_scalar_index` for a stable entry point.
